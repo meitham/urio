@@ -10,7 +10,7 @@ venv
 dist
 build
 .aider*
-# Local-only: agent instructions and the private Gitea CI mirror.
+# Local-only files, not part of the public tree.
 CLAUDE.md
 .gitea/
 /site

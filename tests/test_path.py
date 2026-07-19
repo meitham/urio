@@ -410,10 +410,10 @@ async def test_chain_slots_recycled(backend, tmp_path):
 
 async def test_pure_path_additions(backend):
     # given: paths built from parts
-    p = urio.Path('/tmp/claude/a/b.txt')
+    p = urio.Path('/tmp/proj/a/b.txt')
 
     # then: the pathlib mirrors behave like their pathlib counterparts
-    assert p.is_relative_to('/tmp/claude')
+    assert p.is_relative_to('/tmp/proj')
     assert not p.is_relative_to('/var')
     assert urio.Path.cwd() == pathlib.Path.cwd()
     assert urio.Path.home() == pathlib.Path.home()

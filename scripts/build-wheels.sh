@@ -7,13 +7,13 @@
 #   - Windows x86_64   (MSVC, cross-compiled via cargo-xwin; thread backend)
 #
 # macOS wheels need the macOS SDK and are not cross-buildable from Linux without
-# osxcross; build those on a Mac or a macOS CI runner (see .gitea/workflows).
+# osxcross; build those on a Mac or a macOS CI runner (see .github/workflows).
 #
 # Requires: podman (or docker), network access to the container registry.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "$0")/.." && pwd)"
-RUST_IMAGE="${RUST_IMAGE:-harbor.meitham.com/dockerhub/rust:1-bookworm}"
+RUST_IMAGE="${RUST_IMAGE:-docker.io/rust:1-bookworm}"
 ENGINE="${ENGINE:-podman}"
 mkdir -p "$REPO/dist"
 

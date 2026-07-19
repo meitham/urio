@@ -2,7 +2,7 @@
 name = "urio"
 # Single source of truth for the release version: pyproject.toml declares
 # `dynamic = ["version"]` and maturin reads this field. Tag releases vX.Y.Z.
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Real async file I/O for Python, powered by io_uring"
 license = "MIT"

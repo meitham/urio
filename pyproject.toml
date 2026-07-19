@@ -33,6 +33,7 @@ dependencies = []
 
 [project.urls]
 Homepage = "https://github.com/meitham/urio"
+Documentation = "https://urio.readthedocs.io"
 Repository = "https://github.com/meitham/urio"
 Issues = "https://github.com/meitham/urio/issues"
 

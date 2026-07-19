@@ -1,5 +1,8 @@
 # urio
 
+[![PyPI](https://img.shields.io/pypi/v/urio)](https://pypi.org/project/urio/)
+[![Documentation](https://readthedocs.org/projects/urio/badge/?version=latest)](https://urio.readthedocs.io/en/latest/)
+
 Async file I/O for Python that is actually asynchronous.
 
 On Linux, urio submits reads and writes through
@@ -217,9 +220,11 @@ Run it yourself: `python benchmarks/bench_vs_aiofiles.py --markdown --json out.j
 
 ## Documentation
 
+The full documentation lives at
+[urio.readthedocs.io](https://urio.readthedocs.io/).
 [ARCHITECTURE.md](ARCHITECTURE.md) is the code-reader's tour: the ring/eventfd
-bridge, the zero-copy rules, linked chains, and the backend stack. The full
-site is built with MkDocs Material:
+bridge, the zero-copy rules, linked chains, and the backend stack. To build
+the site locally:
 
 ```bash
 pip install -e ".[docs]"

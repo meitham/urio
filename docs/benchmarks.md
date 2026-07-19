@@ -160,6 +160,80 @@ workloads are bound by the commit, not the async library — reach for urio's
 batched `fsync` when you have **many** files to make durable, and expect large
 single-file durable writes to converge with everything else on the device.
 
+## Real-world workload: Sanic static file serving
+
+Microbenchmarks isolate the I/O layer; this section measures urio inside
+someone else's production code. [Sanic](https://sanic.dev) serves every
+`app.static` file through `aiofiles.open` (via the module-global
+`sanic.compat.aio_open`), so rebinding **one name at runtime** —
+`sanic.compat.aio_open = urio.open` — swaps the file layer of a major web
+framework with no source patched: `urio.open` is awaitable and an async
+context manager exactly like aiofiles'.
+
+Method: Sanic 25.12.1, single process, access log off; an aiohttp load
+generator on the same machine with 32 concurrent connections; 100-request
+warm-up (warm page cache), then 12-second timed runs, median of 3; served
+bodies verified byte-identical (md5) to the on-disk files in both modes.
+CPython 3.12 throughout. Requests per second, `urio ÷ aiofiles` as the ratio:
+
+**4-core Intel i5-6500 (Skylake), Linux, ext4 — urio on io_uring:**
+
+| File | aiofiles | urio | ratio |
+|---|--:|--:|--:|
+| 4 KB | 1,719 | 2,258 | **1.31×** |
+| 64 KB | 1,678 | 2,133 | **1.27×** |
+| 1 MB | 866 | 889 | 1.03× |
+
+**8-thread Intel Xeon E5-1620, Linux, ZFS — urio on io_uring:**
+
+| File | aiofiles | urio | ratio |
+|---|--:|--:|--:|
+| 4 KB | 1,262 | 1,619 | **1.28×** |
+| 64 KB | 1,206 | 1,504 | **1.25×** |
+| 1 MB | 616 | 661 | 1.07× |
+
+**14-core Apple M4 Pro, macOS — urio on the thread backend:**
+
+| File | aiofiles | urio | ratio |
+|---|--:|--:|--:|
+| 4 KB | 4,524 | 4,694 | 1.04× |
+| 64 KB | 4,300 | 4,451 | 1.04× |
+| 1 MB | 3,175 | 3,219 | 1.01× |
+
+Three things worth reading out of the numbers:
+
+- **The win is per-op cost, not copy bandwidth — so more cores do not rescue
+  the thread pool.** A plausible objection is that a 4-core box starves
+  aiofiles' executor and a bigger CPU would close the gap. The 8-thread box
+  answers it: the ratio barely moves (1.31×/1.27× → 1.28×/1.25×). Each
+  request costs aiofiles open + read(s) + close, each a GIL-mediated thread
+  hop, and extra cores don't make those hops cheaper — while urio batches
+  them into the ring. Median latency drops accordingly (4 KB p50 18.7 → 14.3
+  ms on the 4-core box, 24.3 → 19.3 ms on the 8-thread box).
+- **At 1 MB both modes converge** — the Python HTTP client and server stack
+  becomes the bottleneck (~900 MB/s through the loopback on the 4-core box),
+  so the file layer stops mattering. That row is a floor on urio's benefit,
+  not a ceiling.
+- **On macOS urio runs its thread backend and lands at parity or a few
+  percent ahead** (its read path is a single `FileIO.readall` executor hop) —
+  swapping urio in never costs anything on platforms without a native
+  backend.
+
+The same swap-and-measure exercise on
+[aiologger](https://github.com/async-worker/aiologger)'s unmodified
+`AsyncFileHandler` (an awaited write+flush per log record) gave 2.3×
+sequentially and 5.2× with 100 concurrent writers on the 4-core io_uring box
+— the per-op story, amplified.
+
+!!! note "The same opportunity exists beyond aiofiles"
+    Frameworks that moved off aiofiles didn't move off thread pools:
+    [anyio](https://anyio.readthedocs.io/)'s `Path` and `open_file` — what
+    Starlette and FastAPI use for static files — dispatch every file
+    operation to a worker thread via `to_thread.run_sync`. An
+    io_uring-backed file layer could slot in there just as it does for
+    aiofiles; today that means using `urio.open`/`urio.Path` directly in
+    application code.
+
 ## Windows (IOCP backend)
 
 The Windows [IOCP backend](getting-started/backends.md) is production-validated on

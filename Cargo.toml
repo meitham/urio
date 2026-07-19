@@ -1,0 +1,43 @@
+[package]
+name = "urio"
+# Single source of truth for the release version: pyproject.toml declares
+# `dynamic = ["version"]` and maturin reads this field. Tag releases vX.Y.Z.
+version = "0.1.0"
+edition = "2021"
+description = "Real async file I/O for Python, powered by io_uring"
+license = "MIT"
+repository = "https://github.com/meitham/urio"
+publish = false
+
+[lib]
+name = "_uring"
+crate-type = ["cdylib"]
+
+[dependencies]
+# generate-import-lib lets abi3 wheels cross-compile to Windows without a real
+# Windows Python install (PyO3 synthesises the python3.dll import library).
+pyo3 = { version = "0.29", features = [
+    "extension-module",
+    "abi3-py312",
+    "generate-import-lib",
+] }
+
+# io_uring is a Linux-only interface, so the native backend only depends on it
+# (and libc) on Linux. On other targets the crate compiles to an empty module
+# and urio uses its thread-pool backend.
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7"
+libc = "0.2"
+
+# Windows: real async file I/O via overlapped I/O + I/O completion ports (IOCP).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_IO",
+] }
+
+[profile.release]
+lto = true
+codegen-units = 1

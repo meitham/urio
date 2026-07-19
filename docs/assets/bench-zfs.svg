@@ -1,0 +1,31 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="750" height="318" viewBox="0 0 750 318" font-family="sans-serif">
+<rect width="750" height="318" fill="white"/>
+<rect x="0" y="0" width="750" height="6" fill="#e08a3c"/>
+<text x="90" y="30" font-size="17" font-weight="bold" fill="#222222">ZFS taxes durable writes</text>
+<text x="90" y="50" font-size="12.5" font-weight="bold" fill="#e08a3c">binary write+fsync · urio[uring] median ms · lower is faster</text>
+<text x="90" y="68" font-size="12" fill="#666">io_uring · CPython 3.14.6 GIL · median of 7 · aiofiles pays the same tax (speedup ~1.0×)</text>
+<rect x="90" y="88" width="12" height="12" fill="#3b6ea5"/>
+<text x="106" y="98" font-size="11" fill="#222222">ext4 on SATA HDD</text>
+<rect x="240" y="88" width="12" height="12" fill="#e08a3c"/>
+<text x="256" y="98" font-size="11" fill="#222222">ZFS</text>
+<text x="82" y="124" font-size="12" fill="#222222" text-anchor="end">4 KB</text>
+<rect x="90" y="108" width="27.3" height="16" fill="#3b6ea5" rx="2"/>
+<text x="123.3" y="121" font-size="11" font-weight="bold" fill="#3b6ea5">94 ms</text>
+<rect x="90" y="128" width="109.7" height="16" fill="#e08a3c" rx="2"/>
+<text x="205.7" y="141" font-size="11" font-weight="bold" fill="#e08a3c">378 ms (4×)</text>
+<text x="82" y="170" font-size="12" fill="#222222" text-anchor="end">64 KB</text>
+<rect x="90" y="154" width="4.9" height="16" fill="#3b6ea5" rx="2"/>
+<text x="100.9" y="167" font-size="11" font-weight="bold" fill="#3b6ea5">17 ms</text>
+<rect x="90" y="174" width="120.7" height="16" fill="#e08a3c" rx="2"/>
+<text x="216.7" y="187" font-size="11" font-weight="bold" fill="#e08a3c">416 ms (24×)</text>
+<text x="82" y="216" font-size="12" fill="#222222" text-anchor="end">1 MB</text>
+<rect x="90" y="200" width="4.6" height="16" fill="#3b6ea5" rx="2"/>
+<text x="100.6" y="213" font-size="11" font-weight="bold" fill="#3b6ea5">16 ms</text>
+<rect x="90" y="220" width="190.3" height="16" fill="#e08a3c" rx="2"/>
+<text x="286.3" y="233" font-size="11" font-weight="bold" fill="#e08a3c">656 ms (41×)</text>
+<text x="82" y="262" font-size="12" fill="#222222" text-anchor="end">8 MB</text>
+<rect x="90" y="246" width="7.0" height="16" fill="#3b6ea5" rx="2"/>
+<text x="103.0" y="259" font-size="11" font-weight="bold" fill="#3b6ea5">24 ms</text>
+<rect x="90" y="266" width="491.8" height="16" fill="#e08a3c" rx="2"/>
+<text x="587.8" y="279" font-size="11" font-weight="bold" fill="#e08a3c">1695 ms (71×)</text>
+</svg>

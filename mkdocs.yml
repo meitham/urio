@@ -1,0 +1,52 @@
+site_name: urio
+site_description: Real async file I/O for Python, powered by io_uring
+repo_url: https://github.com/meitham/urio
+repo_name: meitham/urio
+
+theme:
+  name: material
+  features:
+    - navigation.sections
+    - navigation.top
+    - content.code.copy
+    - content.code.annotate
+  palette:
+    - media: '(prefers-color-scheme: light)'
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-night
+        name: Switch to dark mode
+    - media: '(prefers-color-scheme: dark)'
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/weather-sunny
+        name: Switch to light mode
+
+nav:
+  - Home: index.md
+  - Getting started:
+      - Installation: getting-started/installation.md
+      - Quickstart: getting-started/quickstart.md
+      - Backends: getting-started/backends.md
+  - API reference:
+      - Opening files: api/open.md
+      - File objects: api/files.md
+      - urio.Path: api/path.md
+      - Backend control: api/backends.md
+  - Benchmarks: benchmarks.md
+  - How it works: internals.md
+
+markdown_extensions:
+  - admonition
+  - pymdownx.details
+  - pymdownx.superfences
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.inlinehilite
+  - tables
+  - toc:
+      permalink: true

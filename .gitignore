@@ -1,0 +1,19 @@
+/target
+__pycache__
+*.pyc
+*.so
+.pytest_cache
+.ruff_cache
+.venv
+venv
+*.egg-info
+dist
+build
+.aider*
+# Local-only: agent instructions and the private Gitea CI mirror.
+CLAUDE.md
+.gitea/
+/site
+/dist-cross
+/dist-*
+uv.lock

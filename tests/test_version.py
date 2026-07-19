@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from importlib.metadata import version as dist_version
+
 import urio
 
 
@@ -8,8 +10,8 @@ def test_version():
     # when: we access the version
     version = urio.__version__
 
-    # then: version is set correctly
-    assert version == '0.1.0'
+    # then: it matches the installed distribution's metadata
+    assert version == dist_version('urio')
 
 
 def test_public_api():

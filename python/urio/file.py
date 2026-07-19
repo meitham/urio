@@ -17,14 +17,14 @@ manager, mirroring ``aiofiles``::
 
 from __future__ import annotations
 
-import asyncio
-import errno
-import io
-import locale
-import os
-import sys
+import asyncio as _asyncio
+import errno as _errno
+import io as _io
+import locale as _locale
+import os as _os
+import sys as _sys
 
-from .backend import get_backend
+from .backend import get_backend as _get_backend
 
 # Chunk used for line-oriented reads and the text decoder.
 DEFAULT_CHUNK = 128 * 1024
@@ -45,7 +45,7 @@ APPEND_OFFSET = -1
 # 32 KiB was the empirical crossover on an 8-core Windows box (64 KiB text reads
 # went from ~0.35x to ~0.83x vs aiofiles; smaller reads unaffected).
 _CODEC_OFFLOAD_MIN = 32 * 1024
-_gil_enabled = getattr(sys, '_is_gil_enabled', None)
+_gil_enabled = getattr(_sys, '_is_gil_enabled', None)
 
 
 def _should_offload_codec(n: int) -> bool:
@@ -79,27 +79,27 @@ def _parse_mode(mode: str):
     # fd in *text* mode and os.read/os.write silently translate CRLF<->LF, which
     # corrupts binary data and desyncs byte offsets. urio does all newline
     # handling itself at the Python layer, so every fd must be binary.
-    flags = getattr(os, 'O_CLOEXEC', 0) | getattr(os, 'O_BINARY', 0)
+    flags = getattr(_os, 'O_CLOEXEC', 0) | getattr(_os, 'O_BINARY', 0)
     readable = writable = appending = False
 
     if 'r' in chars:
-        flags |= os.O_RDWR if plus else os.O_RDONLY
+        flags |= _os.O_RDWR if plus else _os.O_RDONLY
         readable = True
         writable = plus
     elif 'w' in chars:
-        flags |= os.O_RDWR if plus else os.O_WRONLY
-        flags |= os.O_CREAT | os.O_TRUNC
+        flags |= _os.O_RDWR if plus else _os.O_WRONLY
+        flags |= _os.O_CREAT | _os.O_TRUNC
         writable = True
         readable = plus
     elif 'a' in chars:
-        flags |= os.O_RDWR if plus else os.O_WRONLY
-        flags |= os.O_CREAT | os.O_APPEND
+        flags |= _os.O_RDWR if plus else _os.O_WRONLY
+        flags |= _os.O_CREAT | _os.O_APPEND
         writable = True
         readable = plus
         appending = True
     elif 'x' in chars:
-        flags |= os.O_RDWR if plus else os.O_WRONLY
-        flags |= os.O_CREAT | os.O_EXCL
+        flags |= _os.O_RDWR if plus else _os.O_WRONLY
+        flags |= _os.O_CREAT | _os.O_EXCL
         writable = True
         readable = plus
 
@@ -125,7 +125,7 @@ class AsyncBufferedFile:
         self._mode = mode
         self._readable = readable
         self._writable = writable
-        self._backend = get_backend()
+        self._backend = _get_backend()
         self._closed = False
         self._appending = appending
         # Logical position of the next byte to read/write. _buf holds read-ahead
@@ -196,7 +196,7 @@ class AsyncBufferedFile:
     async def read(self, size: int | None = -1) -> bytes:
         self._check_open()
         if not self._readable:
-            raise io.UnsupportedOperation('not readable')
+            raise _io.UnsupportedOperation('not readable')
         if size is None or size < 0:
             await self._readall()
             data = self._buf
@@ -228,7 +228,7 @@ class AsyncBufferedFile:
     async def readinto(self, b) -> int:
         self._check_open()
         if not self._readable:
-            raise io.UnsupportedOperation('not readable')
+            raise _io.UnsupportedOperation('not readable')
         n = len(b)
         await self._fill(n)
         avail = min(n, len(self._buf))
@@ -243,7 +243,7 @@ class AsyncBufferedFile:
     async def readline(self, size: int | None = -1) -> bytes:
         self._check_open()
         if not self._readable:
-            raise io.UnsupportedOperation('not readable')
+            raise _io.UnsupportedOperation('not readable')
         parts = []
         total = 0
         while True:
@@ -302,7 +302,7 @@ class AsyncBufferedFile:
     async def write(self, data) -> int:
         self._check_open()
         if not self._writable:
-            raise io.UnsupportedOperation('not writable')
+            raise _io.UnsupportedOperation('not writable')
         if isinstance(data, str):
             raise TypeError('a bytes-like object is required, not str')
         data = bytes(data)
@@ -328,7 +328,7 @@ class AsyncBufferedFile:
                 # failure raises OSError upstream), so report the stall as EIO
                 # instead of guessing a cause.
                 raise OSError(
-                    errno.EIO, f'write returned {written} of {total - n} bytes'
+                    _errno.EIO, f'write returned {written} of {total - n} bytes'
                 )
             n += written
             self._offset += written
@@ -344,7 +344,7 @@ class AsyncBufferedFile:
         # ring; a single line is a plain write.
         self._check_open()
         if not self._writable:
-            raise io.UnsupportedOperation('not writable')
+            raise _io.UnsupportedOperation('not writable')
         bufs = [b if type(b) is bytes else bytes(b) for b in lines]
         bufs = [b for b in bufs if b]
         if not bufs:
@@ -371,7 +371,7 @@ class AsyncBufferedFile:
                 append=self._appending,
             )
             if written < 0:
-                raise OSError(errno.EIO, f'writev returned {written}')
+                raise OSError(_errno.EIO, f'writev returned {written}')
             self._offset += written
             if written < total:
                 # Short vectored write (rare): push the unwritten tail through
@@ -396,14 +396,14 @@ class AsyncBufferedFile:
         self._check_open()
         return self._offset
 
-    async def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+    async def seek(self, offset: int, whence: int = _os.SEEK_SET) -> int:
         self._check_open()
         self._buf = b''
-        if whence == os.SEEK_SET:
+        if whence == _os.SEEK_SET:
             new = offset
-        elif whence == os.SEEK_CUR:
+        elif whence == _os.SEEK_CUR:
             new = self._offset + offset
-        elif whence == os.SEEK_END:
+        elif whence == _os.SEEK_END:
             # Size the open fd, not the path — the name may have been renamed,
             # replaced, or unlinked since open (log rotation, atomic replace).
             new = await self._backend.filesize(self._fd) + offset
@@ -417,7 +417,7 @@ class AsyncBufferedFile:
     async def truncate(self, size: int | None = None) -> int:
         self._check_open()
         if not self._writable:
-            raise io.UnsupportedOperation('not writable')
+            raise _io.UnsupportedOperation('not writable')
         if size is None:
             size = self._offset
         await self._backend.ftruncate(self._fd, size)
@@ -497,7 +497,7 @@ class AsyncTextFile:
             self._read_terminator = newline
         # Write translation.
         if newline is None:
-            self._write_newline = os.linesep
+            self._write_newline = _os.linesep
         elif newline == '':
             self._write_newline = ''
         else:
@@ -571,7 +571,7 @@ class AsyncTextFile:
         large payloads on a free-threaded interpreter so concurrent files'
         codecs run on separate cores (see :func:`_should_offload_codec`)."""
         if _should_offload_codec(len(chunk)):
-            loop = asyncio.get_running_loop()
+            loop = _asyncio.get_running_loop()
             return await loop.run_in_executor(
                 None, self._decode_and_translate, chunk, final
             )
@@ -709,7 +709,7 @@ class AsyncTextFile:
         # free-threaded interpreter, so concurrent writers encode on separate
         # cores instead of serialising on the loop thread; inline otherwise.
         if _should_offload_codec(len(text)):
-            loop = asyncio.get_running_loop()
+            loop = _asyncio.get_running_loop()
             data = await loop.run_in_executor(None, self._encode, text)
         else:
             data = self._encode(text)
@@ -737,7 +737,7 @@ class AsyncTextFile:
         pending = len(self._tbuf.encode(self._encoding, self._errors))
         return max(0, self._raw.tell() - pending)
 
-    async def seek(self, offset: int, whence: int = os.SEEK_SET) -> int:
+    async def seek(self, offset: int, whence: int = _os.SEEK_SET) -> int:
         self._check_open()
         # Positions are byte offsets, matching tell(). Seek to a value tell()
         # returned (call tell() with nothing buffered for an exact cookie) to
@@ -745,15 +745,15 @@ class AsyncTextFile:
         # decoder and newline state. Seeking to an arbitrary byte that splits a
         # code point or a `\r\n` pair is allowed but — as with CPython's
         # TextIOWrapper on a non-cookie target — may mis-decode the next chars.
-        if whence == os.SEEK_CUR:
+        if whence == _os.SEEK_CUR:
             if offset == 0:
                 return self.tell()
             offset = self.tell() + offset
-            whence = os.SEEK_SET
-        if whence == os.SEEK_SET:
+            whence = _os.SEEK_SET
+        if whence == _os.SEEK_SET:
             new = await self._raw.seek(offset)
-        elif whence == os.SEEK_END:
-            new = await self._raw.seek(offset, os.SEEK_END)
+        elif whence == _os.SEEK_END:
+            new = await self._raw.seek(offset, _os.SEEK_END)
         else:
             raise ValueError(f'invalid whence: {whence}')
         self._tbuf = ''
@@ -787,10 +787,10 @@ class AsyncTextFile:
 async def _open(
     path, mode, encoding, errors, newline
 ) -> AsyncBufferedFile | AsyncTextFile:
-    backend = get_backend()
+    backend = _get_backend()
     flags, binary, readable, writable, appending = _parse_mode(mode)
-    fspath = os.fspath(path)
-    name = fspath if isinstance(fspath, str) else os.fsdecode(fspath)
+    fspath = _os.fspath(path)
+    name = fspath if isinstance(fspath, str) else _os.fsdecode(fspath)
 
     fd = await backend.open(name, flags, 0o666)
     size = 0
@@ -815,7 +815,7 @@ async def _open(
     if binary:
         return raw
     if encoding is None:
-        encoding = locale.getpreferredencoding(False)
+        encoding = _locale.getpreferredencoding(False)
     if errors is None:
         errors = 'strict'
     return AsyncTextFile(raw, encoding=encoding, errors=errors, newline=newline)

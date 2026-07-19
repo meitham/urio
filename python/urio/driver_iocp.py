@@ -25,9 +25,9 @@ durable writes win.
 
 from __future__ import annotations
 
-import asyncio
-import ctypes
-import weakref
+import asyncio as _asyncio
+import ctypes as _ctypes
+import weakref as _weakref
 
 from . import _uring
 
@@ -37,15 +37,15 @@ from . import _uring
 # the dict's strong value reference keeps the key alive forever. The dict below
 # is only a weak-VALUE fallback for loops that reject attribute assignment.
 _DRIVER_ATTR = '_urio_iocp_driver'
-_drivers: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
+_drivers: _weakref.WeakKeyDictionary = _weakref.WeakKeyDictionary()
 
 
 class IocpDriver:
     """Bridges one IOCP into a single asyncio event loop."""
 
-    def __init__(self, loop: asyncio.AbstractEventLoop):
+    def __init__(self, loop: _asyncio.AbstractEventLoop):
         self._loop = loop
-        self._futures: dict[int, asyncio.Future] = {}
+        self._futures: dict[int, _asyncio.Future] = {}
         # The native poller thread delivers a whole batch of completions via one
         # call_soon_threadsafe(self._on_complete, batch), so it runs back on the
         # loop thread.
@@ -60,7 +60,7 @@ class IocpDriver:
             if status != 0:
                 # status is a Win32 error code; FormatError gives a real message
                 # and the code is preserved as the OSError winerror.
-                fut.set_exception(OSError(0, ctypes.FormatError(status), None, status))
+                fut.set_exception(OSError(0, _ctypes.FormatError(status), None, status))
             else:
                 fut.set_result((value, data))
 
@@ -98,9 +98,9 @@ class IocpDriver:
         self._futures.clear()
 
 
-def get_iocp_driver(loop: asyncio.AbstractEventLoop | None = None) -> IocpDriver:
+def get_iocp_driver(loop: _asyncio.AbstractEventLoop | None = None) -> IocpDriver:
     if loop is None:
-        loop = asyncio.get_running_loop()
+        loop = _asyncio.get_running_loop()
     driver = getattr(loop, _DRIVER_ATTR, None)
     if driver is None:
         ref = _drivers.get(loop)
@@ -110,11 +110,11 @@ def get_iocp_driver(loop: asyncio.AbstractEventLoop | None = None) -> IocpDriver
         try:
             setattr(loop, _DRIVER_ATTR, driver)
         except AttributeError:
-            _drivers[loop] = weakref.ref(driver)
+            _drivers[loop] = _weakref.ref(driver)
     return driver
 
 
-def close_driver(loop: asyncio.AbstractEventLoop) -> None:
+def close_driver(loop: _asyncio.AbstractEventLoop) -> None:
     """Shut down and discard the driver cached on ``loop``, if any."""
     driver = getattr(loop, _DRIVER_ATTR, None)
     if driver is not None:

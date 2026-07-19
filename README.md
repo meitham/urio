@@ -22,7 +22,7 @@ the builtin `open()`), so switching is mostly changing the import.
 - The familiar file API: `read`, `readline`, `readlines`, `write`,
   `writelines`, `seek`, `tell`, `truncate`, `flush`, async iteration, text and
   binary modes.
-- An async `pathlib`: `urio.Path` with async `stat`, `mkdir`, `unlink`,
+- An async `pathlib.Path`: `urio.Path` with async `stat`, `mkdir`, `unlink`,
   `rename`, `symlink_to`, `read_text`/`write_text`/`read_bytes`/`write_bytes`,
   `iterdir`, `glob`, `walk`, and the full set of pure-path helpers.
 - A thread-pool fallback wherever native async I/O is unavailable, same API.

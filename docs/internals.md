@@ -101,9 +101,10 @@ the helpers transparently fall back to the classic open/read/close path.
 
 io_uring reads and writes are *positional* (offset-based). The file objects
 track a logical offset themselves and add a small read-ahead buffer, which is
-what gives ordinary `read`/`readline` semantics on top of positioned I/O. A
-short read on a regular file is treated as EOF, avoiding a redundant syscall to
-confirm it.
+what gives ordinary `read`/`readline` semantics on top of positioned I/O. Only
+an *empty* read is treated as EOF — a short but non-empty read just triggers
+another read for the remainder, since a single read may legitimately return
+fewer bytes than requested.
 
 ## Windows and the fallback
 

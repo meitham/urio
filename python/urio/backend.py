@@ -60,6 +60,42 @@ async def _to_thread(fn, *args):
     return await loop.run_in_executor(None, fn, *args)
 
 
+# Executor jobs that were cancelled after they started running, keyed by the
+# fd they operate on. A running job cannot be stopped, and it keeps using the
+# fd (seek/read/write) after the awaiting task has moved on — so close() must
+# drain these before releasing the fd, or the OS may recycle the fd number for
+# a new open() and the stale job will corrupt the new file's position.
+_orphans: dict[int, set[_asyncio.Future]] = {}
+
+
+def _reap_orphan(fd: int, fut: _asyncio.Future) -> None:
+    s = _orphans.get(fd)
+    if s is not None:
+        s.discard(fut)
+        if not s:
+            _orphans.pop(fd, None)
+    # Consume the outcome so a failed orphan doesn't warn as unraisable.
+    if not fut.cancelled():
+        fut.exception()
+
+
+async def _to_thread_fd(fd, fn, *args):
+    """Like ``_to_thread`` for operations that touch ``fd``: if the awaiting
+    task is cancelled, park the job so ``close(fd)`` waits for it before
+    freeing the fd. The executor future is shielded because cancelling it
+    only cancels the proxy — the worker-thread job runs to completion
+    regardless, and the proxy must stay awaitable so close() can wait."""
+    loop = _asyncio.get_running_loop()
+    fut = loop.run_in_executor(None, fn, *args)
+    try:
+        return await _asyncio.shield(fut)
+    except _asyncio.CancelledError:
+        if not fut.done():
+            _orphans.setdefault(fd, set()).add(fut)
+            fut.add_done_callback(lambda f, fd=fd: _reap_orphan(fd, f))
+        raise
+
+
 _READ_CHUNK = 1 << 20
 # io_uring read/write lengths are u32; keep a single submission well under 4 GiB.
 _READ_MAX = 1 << 30
@@ -177,12 +213,12 @@ class ThreadBackend:
         return await _to_thread(_os.open, path, flags, mode)
 
     async def read(self, fd: int, offset: int, length: int) -> bytes:
-        return await _to_thread(_pread, fd, length, offset)
+        return await _to_thread_fd(fd, _pread, fd, length, offset)
 
     async def readall(self, fd: int, offset: int) -> bytes:
         # Read from `offset` to EOF in a single executor round-trip (the C-level
         # loop runs inside the worker thread), matching aiofiles' behaviour.
-        return await _to_thread(_read_all, fd, offset)
+        return await _to_thread_fd(fd, _read_all, fd, offset)
 
     async def write(
         self, fd: int, offset: int, data: bytes, append: bool = False
@@ -190,8 +226,8 @@ class ThreadBackend:
         if append:
             # O_APPEND writes atomically at end; pwrite would ignore it and
             # write at the given offset. Uses the fast FileIO path on Windows.
-            return await _to_thread(_append_write, fd, data)
-        return await _to_thread(_pwrite, fd, data, offset)
+            return await _to_thread_fd(fd, _append_write, fd, data)
+        return await _to_thread_fd(fd, _pwrite, fd, data, offset)
 
     async def writev(
         self, fd: int, offset: int, bufs: list[bytes], append: bool = False
@@ -200,19 +236,24 @@ class ThreadBackend:
         # back to the plain write path (Windows has no writev).
         if append:
             if hasattr(_os, 'writev'):
-                return await _to_thread(_os.writev, fd, bufs)
+                return await _to_thread_fd(fd, _os.writev, fd, bufs)
             return await self.write(fd, offset, b''.join(bufs), True)
         if hasattr(_os, 'pwritev'):
-            return await _to_thread(_os.pwritev, fd, bufs, offset)
+            return await _to_thread_fd(fd, _os.pwritev, fd, bufs, offset)
         return await self.write(fd, offset, b''.join(bufs))
 
     async def fsync(self, fd: int, datasync: bool = False) -> None:
         # os.fdatasync is Linux-only; on macOS/Windows fall back to os.fsync
         # (which flushes data to disk just the same, only with full metadata).
         fn = _fdatasync if datasync else _os.fsync
-        await _to_thread(fn, fd)
+        await _to_thread_fd(fd, fn, fd)
 
     async def close(self, fd: int) -> None:
+        orphans = _orphans.pop(fd, None)
+        if orphans:
+            # Cancelled-but-running jobs still use this fd; let them finish
+            # before the fd number can be recycled by a new open().
+            await _asyncio.gather(*orphans, return_exceptions=True)
         await _to_thread(_os.close, fd)
 
     async def statx(self, path: str, follow: bool = True) -> _os.stat_result:
@@ -244,7 +285,7 @@ class ThreadBackend:
     # -- always executor-backed (no io_uring opcode in the crate) ---------
 
     async def ftruncate(self, fd: int, length: int) -> None:
-        await _to_thread(_os.ftruncate, fd, length)
+        await _to_thread_fd(fd, _os.ftruncate, fd, length)
 
     async def chmod(self, path: str, mode: int) -> None:
         await _to_thread(_os.chmod, path, mode)

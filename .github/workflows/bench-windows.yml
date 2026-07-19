@@ -1,0 +1,46 @@
+name: Windows benchmark
+
+# Manual benchmark run on a windows-latest runner. Shared virtual hardware:
+# absolute numbers are indicative only, but same-runner ratios (urio vs
+# aiofiles, and between URIO_IOCP_EXECUTOR_READ_MIN settings on branches
+# that support it) are meaningful.
+
+on:
+  workflow_dispatch:
+
+jobs:
+  bench:
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install maturin aiofiles
+          maturin build --release --out dist
+          pip install --no-index --find-links dist urio
+      - name: Bench IOCP (executor read route off)
+        env:
+          URIO_WINDOWS_IOCP: '1'
+          URIO_IOCP_EXECUTOR_READ_MIN: '0'
+        run: python benchmarks/bench_vs_aiofiles.py --markdown --json bench-off.json
+      - name: Bench IOCP (executor reads at 256 KB)
+        env:
+          URIO_WINDOWS_IOCP: '1'
+          URIO_IOCP_EXECUTOR_READ_MIN: '262144'
+        run: python benchmarks/bench_vs_aiofiles.py --markdown --json bench-256k.json
+      - name: Bench IOCP (executor reads at 64 KB)
+        env:
+          URIO_WINDOWS_IOCP: '1'
+          URIO_IOCP_EXECUTOR_READ_MIN: '65536'
+        run: python benchmarks/bench_vs_aiofiles.py --markdown --json bench-64k.json
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-windows-results
+          path: bench-*.json

@@ -79,21 +79,24 @@ aiofiles closely throughout, so the chart focuses on the io_uring backend.
 
 - **Buffered writes** win at every size up to large — submission batching for
   small/medium files (one `io_uring_enter` per loop tick instead of one syscall
-  per op) for **2.9–5.3×** at 4–64 KB, and zero-copy submission for large binary
-  ones (**1.5× at 1 MB, parity at 8 MB**; the caller's Python `bytes` is handed
-  to the kernel with no per-write `memcpy`). Large *text* writes trail (they
-  re-encode before submitting).
+  per op) for **3.4–5.2×** at 4–64 KB, and zero-copy submission for large binary
+  ones (**1.7× at 1 MB, parity at 8 MB**; the caller's Python `bytes` is handed
+  to the kernel with no per-write `memcpy`). Large *text* writes still trail
+  (**0.6–0.7×**) but the gap roughly halved in 0.2.0: multi-megabyte encodes
+  now run in the executor instead of stalling the event loop mid-batch.
 - **Durable writes** (`write + fsync`) converge on disk bandwidth — small/medium
-  files still win big on batched `fsync` (**3.9–5.8×**), large binary stays
-  ahead (**1.0–2.0×**), large text dips below it.
-- **Warm reads** win small/medium (**2.6–3.5×**, where aiofiles' pool starves
-  under concurrency) and now hold up at large sizes too: reads are **zero-copy**
-  (the kernel fills the returned `bytes` directly, no second `memcpy`) and big
-  reads are punted to io-wq workers so their page-cache copies run on multiple
-  cores — large *binary* lands at **1.0× (1 MB) / 0.7× (8 MB)** (formerly
-  0.3–0.5×) and large *text* wins (**1.1–1.4×**).
-- **Streaming** a 128 MB file in 1 MB chunks now runs well past the pool:
-  binary **6447 MB/s vs aiofiles's 3329 (1.9×)**, text 2249 vs 1783 (**1.3×**) —
+  files still win big on batched `fsync` (**4.1–5.9×**), large binary stays
+  ahead (**1.0–1.9×**), large text dips below it (**0.6–0.8×**).
+- **Warm reads** win small/medium (**2.6–3.4×**, where aiofiles' pool starves
+  under concurrency): reads are **zero-copy** (the kernel fills the returned
+  `bytes` directly, no second `memcpy`) and big reads are punted to io-wq
+  workers so their page-cache copies run on multiple cores. Large *binary*
+  still trails under the GIL (**0.8× at 1 MB, 0.5× at 8 MB** — one loop thread
+  against a pool copying on N cores; without the GIL the 8 MB read flips to a
+  **1.2× win**, see free-threading below) while large *text* wins outright
+  (**1.7–2.0×**).
+- **Streaming** a 128 MB file in 1 MB chunks runs well past the pool:
+  binary **6255 MB/s vs aiofiles's 3108 (2.0×)**, text 1860 vs 1738 (**1.1×**) —
   the zero-copy read path turned what used to be a bandwidth-bound wash into a
   clear win.
 
@@ -105,8 +108,8 @@ flag evicts each file (`fsync` + `posix_fadvise(DONTNEED)`) before every timed
 read, so reads hit storage — io_uring's intended domain.
 
 **Honest result: cold-cache reads land at essentially the same shape as warm —
-small/medium win, large binary trails** (binary 4 KB **3.1×**, 64 KB **2.3×**,
-1 MB **0.76×**, 8 MB **0.64×**; the 128 MB cold stream runs **2.0×**). Two
+small/medium win, large binary trails** (binary 4 KB **3.4×**, 64 KB **2.6×**,
+1 MB **0.77×**, 8 MB **0.45×**; the 128 MB cold stream runs **2.7×**). Two
 reasons, both worth knowing:
 
 1. **The reads never actually reach the platter.** `/data` is a spinning HDD,
@@ -159,80 +162,6 @@ The practical rule: on a copy-on-write filesystem like ZFS, `fsync`-heavy
 workloads are bound by the commit, not the async library — reach for urio's
 batched `fsync` when you have **many** files to make durable, and expect large
 single-file durable writes to converge with everything else on the device.
-
-## Real-world workload: Sanic static file serving
-
-Microbenchmarks isolate the I/O layer; this section measures urio inside
-someone else's production code. [Sanic](https://sanic.dev) serves every
-`app.static` file through `aiofiles.open` (via the module-global
-`sanic.compat.aio_open`), so rebinding **one name at runtime** —
-`sanic.compat.aio_open = urio.open` — swaps the file layer of a major web
-framework with no source patched: `urio.open` is awaitable and an async
-context manager exactly like aiofiles'.
-
-Method: Sanic 25.12.1, single process, access log off; an aiohttp load
-generator on the same machine with 32 concurrent connections; 100-request
-warm-up (warm page cache), then 12-second timed runs, median of 3; served
-bodies verified byte-identical (md5) to the on-disk files in both modes.
-CPython 3.12 throughout. Requests per second, `urio ÷ aiofiles` as the ratio:
-
-**4-core Intel i5-6500 (Skylake), Linux, ext4 — urio on io_uring:**
-
-| File | aiofiles | urio | ratio |
-|---|--:|--:|--:|
-| 4 KB | 1,719 | 2,258 | **1.31×** |
-| 64 KB | 1,678 | 2,133 | **1.27×** |
-| 1 MB | 866 | 889 | 1.03× |
-
-**8-thread Intel Xeon E5-1620, Linux, ZFS — urio on io_uring:**
-
-| File | aiofiles | urio | ratio |
-|---|--:|--:|--:|
-| 4 KB | 1,262 | 1,619 | **1.28×** |
-| 64 KB | 1,206 | 1,504 | **1.25×** |
-| 1 MB | 616 | 661 | 1.07× |
-
-**14-core Apple M4 Pro, macOS — urio on the thread backend:**
-
-| File | aiofiles | urio | ratio |
-|---|--:|--:|--:|
-| 4 KB | 4,524 | 4,694 | 1.04× |
-| 64 KB | 4,300 | 4,451 | 1.04× |
-| 1 MB | 3,175 | 3,219 | 1.01× |
-
-Three things worth reading out of the numbers:
-
-- **The win is per-op cost, not copy bandwidth — so more cores do not rescue
-  the thread pool.** A plausible objection is that a 4-core box starves
-  aiofiles' executor and a bigger CPU would close the gap. The 8-thread box
-  answers it: the ratio barely moves (1.31×/1.27× → 1.28×/1.25×). Each
-  request costs aiofiles open + read(s) + close, each a GIL-mediated thread
-  hop, and extra cores don't make those hops cheaper — while urio batches
-  them into the ring. Median latency drops accordingly (4 KB p50 18.7 → 14.3
-  ms on the 4-core box, 24.3 → 19.3 ms on the 8-thread box).
-- **At 1 MB both modes converge** — the Python HTTP client and server stack
-  becomes the bottleneck (~900 MB/s through the loopback on the 4-core box),
-  so the file layer stops mattering. That row is a floor on urio's benefit,
-  not a ceiling.
-- **On macOS urio runs its thread backend and lands at parity or a few
-  percent ahead** (its read path is a single `FileIO.readall` executor hop) —
-  swapping urio in never costs anything on platforms without a native
-  backend.
-
-The same swap-and-measure exercise on
-[aiologger](https://github.com/async-worker/aiologger)'s unmodified
-`AsyncFileHandler` (an awaited write+flush per log record) gave 2.3×
-sequentially and 5.2× with 100 concurrent writers on the 4-core io_uring box
-— the per-op story, amplified.
-
-!!! note "The same opportunity exists beyond aiofiles"
-    Frameworks that moved off aiofiles didn't move off thread pools:
-    [anyio](https://anyio.readthedocs.io/)'s `Path` and `open_file` — what
-    Starlette and FastAPI use for static files — dispatch every file
-    operation to a worker thread via `to_thread.run_sync`. An
-    io_uring-backed file layer could slot in there just as it does for
-    aiofiles; today that means using `urio.open`/`urio.Path` directly in
-    application code.
 
 ## Windows (IOCP backend)
 
@@ -351,9 +280,9 @@ because the io_uring ABI structs are fixed-width, and validated on this Pi.
 
 Free-threaded CPython (PEP 703, the `t` builds) removes the GIL, and that
 reshapes the warm-cache comparison. **urio runs GIL-free too** — the native
-module declares free-threaded support (`gil_used = false`), and the three native
-classes are `#[pyclass(unsendable)]`, so each ring stays confined to its
-event-loop thread. Crucially, **urio has the same thread-pool mode aiofiles
+module declares free-threaded support (`gil_used = false`), and each ring is
+used only by its own event loop's driver, so no native state is ever shared
+across threads. Crucially, **urio has the same thread-pool mode aiofiles
 does**: its `thread` backend runs the blocking syscalls in the loop's executor,
 so under no-GIL its warm-read copies parallelise across all cores *identically*.
 So this is not urio "losing" free-threading — you keep io_uring/IOCP for the
@@ -375,21 +304,21 @@ speedup vs aiofiles.
 
 | read size | GIL | no-GIL | aiofiles ms (GIL → no-GIL) |
 |---|--:|--:|--:|
-| 4 KB | **3.53×** | **2.21×** | 287 → 176 |
-| 64 KB | **3.23×** | **1.55×** | 72 → 42 |
-| 1 MB | 0.99× | **1.20×** | 26 → 27 |
-| 8 MB | 0.69× | 0.92× | 25 → 28 |
+| 4 KB | **3.40×** | **2.24×** | 285 → 179 |
+| 64 KB | **2.88×** | **1.60×** | 71 → 42 |
+| 1 MB | 0.81× | 0.97× | 29 → 17 |
+| 8 MB | 0.49× | **1.22×** | 25 → 23 |
 
-**Free-threading narrows urio[uring]'s small/medium warm-read edge — but it now
-stays a clear win at every size.** With no GIL, aiofiles and `urio[thread]` copy
-read data into Python `bytes` **in parallel across all cores**, so their small
-reads speed up sharply exactly where a GIL-bound pool was starving — aiofiles
-4 KB 287 → 176 ms, 64 KB 72 → 42 ms — and the small-read multiplier compresses
-(4 KB 3.53× → 2.21×, 64 KB 3.23× → 1.55×). Large reads used to be the story's
-weak spot; with **zero-copy reads** (the kernel fills the returned `bytes`
-directly) plus the io-wq punt for ≥1 MB reads, they sit at **parity under the
-GIL and slightly ahead without it** (1 MB 0.99× → 1.20×, 8 MB 0.69× → 0.92×) —
-free-threaded CPython's costlier refcounting hurts the pool more than the ring.
+**Free-threading narrows urio[uring]'s small/medium warm-read edge — and flips
+the large-read story.** With no GIL, aiofiles and `urio[thread]` copy read data
+into Python `bytes` **in parallel across all cores**, so their small reads
+speed up sharply exactly where a GIL-bound pool was starving — aiofiles 4 KB
+285 → 179 ms, 64 KB 71 → 42 ms — and the small-read multiplier compresses
+(4 KB 3.40× → 2.24×, 64 KB 2.88× → 1.60×). Large reads are the GIL story's
+weak spot (1 MB 0.81×, 8 MB 0.49× — one loop thread against a pool); with
+**zero-copy reads** plus the io-wq punt for ≥1 MB reads, removing the GIL
+brings 1 MB to parity and turns 8 MB into a **1.22× win** — free-threaded
+CPython's costlier refcounting hurts the pool more than the ring.
 (3.15.0b3t sharpens the picture further: binary reads win at **every** size —
 4 KB 1.77×, 64 KB 1.38×, 1 MB 1.14×, 8 MB 1.31× — while small/medium `fsync`
 stays a 2.1–2.5× io_uring win.)

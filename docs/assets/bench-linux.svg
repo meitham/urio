@@ -2,7 +2,7 @@
 <rect width="778" height="584" fill="white"/>
 <rect x="0" y="0" width="778" height="6" fill="#3b6ea5"/>
 <text x="120" y="30" font-size="17" font-weight="bold" fill="#222222">Linux · io_uring vs aiofiles</text>
-<text x="120" y="50" font-size="12.5" font-weight="bold" fill="#3b6ea5">Linux · io_uring · CPython 3.14 · median of 7</text>
+<text x="120" y="50" font-size="12.5" font-weight="bold" fill="#3b6ea5">Linux · io_uring · CPython 3.14 · median of 5</text>
 <text x="120" y="68" font-size="12" fill="#666">speedup vs aiofiles — bars past the 1.0x line mean urio is faster</text>
 <rect x="120" y="80" width="12" height="12" fill="#3b6ea5"/>
 <text x="136" y="90" font-size="11" fill="#222222">4 KB</text>
@@ -12,60 +12,60 @@
 <text x="268" y="90" font-size="11" fill="#222222">1 MB</text>
 <rect x="318" y="80" width="12" height="12" fill="#b5539c"/>
 <text x="334" y="90" font-size="11" fill="#222222">8 MB</text>
-<line x1="212.0" y1="96" x2="212.0" y2="556" stroke="#cccccc" stroke-width="1.5" stroke-dasharray="4 3"/>
-<text x="212.0" y="570" font-size="11" fill="#888" text-anchor="middle">1.0x</text>
+<line x1="211.1" y1="96" x2="211.1" y2="556" stroke="#cccccc" stroke-width="1.5" stroke-dasharray="4 3"/>
+<text x="211.1" y="570" font-size="11" fill="#888" text-anchor="middle">1.0x</text>
 <text x="112" y="138" font-size="11" fill="#222222" text-anchor="end">write · binary</text>
-<rect x="120" y="104" width="338.9" height="13" fill="#3b6ea5" rx="2"/>
-<text x="463.9" y="114" font-size="10.5" fill="#3b6ea5">3.68x</text>
-<rect x="120" y="119" width="486.2" height="13" fill="#2a9d4a" rx="2"/>
-<text x="611.2" y="129" font-size="10.5" fill="#2a9d4a">5.29x</text>
-<rect x="120" y="134" width="135.3" height="13" fill="#e08a3c" rx="2"/>
-<text x="260.3" y="144" font-size="10.5" fill="#e08a3c">1.47x</text>
-<rect x="120" y="149" width="92.0" height="13" fill="#b5539c" rx="2"/>
-<text x="217.0" y="159" font-size="10.5" fill="#b5539c">1.00x</text>
+<rect x="120" y="104" width="370.6" height="13" fill="#3b6ea5" rx="2"/>
+<text x="495.6" y="114" font-size="10.5" fill="#3b6ea5">4.07x</text>
+<rect x="120" y="119" width="474.9" height="13" fill="#2a9d4a" rx="2"/>
+<text x="599.9" y="129" font-size="10.5" fill="#2a9d4a">5.21x</text>
+<rect x="120" y="134" width="151.8" height="13" fill="#e08a3c" rx="2"/>
+<text x="276.8" y="144" font-size="10.5" fill="#e08a3c">1.67x</text>
+<rect x="120" y="149" width="103.0" height="13" fill="#b5539c" rx="2"/>
+<text x="228.0" y="159" font-size="10.5" fill="#b5539c">1.13x</text>
 <text x="112" y="213" font-size="11" fill="#222222" text-anchor="end">write · text</text>
-<rect x="120" y="179" width="267.5" height="13" fill="#3b6ea5" rx="2"/>
-<text x="392.5" y="189" font-size="10.5" fill="#3b6ea5">2.91x</text>
-<rect x="120" y="194" width="341.7" height="13" fill="#2a9d4a" rx="2"/>
-<text x="466.7" y="204" font-size="10.5" fill="#2a9d4a">3.71x</text>
-<rect x="120" y="209" width="64.4" height="13" fill="#e08a3c" rx="2"/>
-<text x="189.4" y="219" font-size="10.5" fill="#e08a3c">0.70x</text>
-<rect x="120" y="224" width="25.7" height="13" fill="#b5539c" rx="2"/>
-<text x="150.7" y="234" font-size="10.5" fill="#b5539c">0.28x</text>
+<rect x="120" y="179" width="310.5" height="13" fill="#3b6ea5" rx="2"/>
+<text x="435.5" y="189" font-size="10.5" fill="#3b6ea5">3.41x</text>
+<rect x="120" y="194" width="333.9" height="13" fill="#2a9d4a" rx="2"/>
+<text x="458.9" y="204" font-size="10.5" fill="#2a9d4a">3.67x</text>
+<rect x="120" y="209" width="56.3" height="13" fill="#e08a3c" rx="2"/>
+<text x="181.3" y="219" font-size="10.5" fill="#e08a3c">0.62x</text>
+<rect x="120" y="224" width="66.6" height="13" fill="#b5539c" rx="2"/>
+<text x="191.6" y="234" font-size="10.5" fill="#b5539c">0.73x</text>
 <text x="112" y="288" font-size="11" fill="#222222" text-anchor="end">fsync · binary</text>
-<rect x="120" y="254" width="414.0" height="13" fill="#3b6ea5" rx="2"/>
-<text x="539.0" y="264" font-size="10.5" fill="#3b6ea5">4.50x</text>
+<rect x="120" y="254" width="459.6" height="13" fill="#3b6ea5" rx="2"/>
+<text x="584.6" y="264" font-size="10.5" fill="#3b6ea5">5.05x</text>
 <rect x="120" y="269" width="535.7" height="13" fill="#2a9d4a" rx="2"/>
-<text x="660.7" y="279" font-size="10.5" fill="#2a9d4a">5.82x</text>
-<rect x="120" y="284" width="184.0" height="13" fill="#e08a3c" rx="2"/>
-<text x="309.0" y="294" font-size="10.5" fill="#e08a3c">2.00x</text>
-<rect x="120" y="299" width="95.8" height="13" fill="#b5539c" rx="2"/>
-<text x="220.8" y="309" font-size="10.5" fill="#b5539c">1.04x</text>
+<text x="660.7" y="279" font-size="10.5" fill="#2a9d4a">5.88x</text>
+<rect x="120" y="284" width="176.5" height="13" fill="#e08a3c" rx="2"/>
+<text x="301.5" y="294" font-size="10.5" fill="#e08a3c">1.94x</text>
+<rect x="120" y="299" width="91.1" height="13" fill="#b5539c" rx="2"/>
+<text x="216.1" y="309" font-size="10.5" fill="#b5539c">1.00x</text>
 <text x="112" y="363" font-size="11" fill="#222222" text-anchor="end">fsync · text</text>
-<rect x="120" y="329" width="355.9" height="13" fill="#3b6ea5" rx="2"/>
-<text x="480.9" y="339" font-size="10.5" fill="#3b6ea5">3.87x</text>
-<rect x="120" y="344" width="424.0" height="13" fill="#2a9d4a" rx="2"/>
-<text x="549.0" y="354" font-size="10.5" fill="#2a9d4a">4.61x</text>
-<rect x="120" y="359" width="80.5" height="13" fill="#e08a3c" rx="2"/>
-<text x="205.5" y="369" font-size="10.5" fill="#e08a3c">0.88x</text>
-<rect x="120" y="374" width="32.0" height="13" fill="#b5539c" rx="2"/>
-<text x="157.0" y="384" font-size="10.5" fill="#b5539c">0.35x</text>
+<rect x="120" y="329" width="376.7" height="13" fill="#3b6ea5" rx="2"/>
+<text x="501.7" y="339" font-size="10.5" fill="#3b6ea5">4.14x</text>
+<rect x="120" y="344" width="375.2" height="13" fill="#2a9d4a" rx="2"/>
+<text x="500.2" y="354" font-size="10.5" fill="#2a9d4a">4.12x</text>
+<rect x="120" y="359" width="70.1" height="13" fill="#e08a3c" rx="2"/>
+<text x="195.1" y="369" font-size="10.5" fill="#e08a3c">0.77x</text>
+<rect x="120" y="374" width="52.4" height="13" fill="#b5539c" rx="2"/>
+<text x="177.4" y="384" font-size="10.5" fill="#b5539c">0.58x</text>
 <text x="112" y="438" font-size="11" fill="#222222" text-anchor="end">read · binary</text>
-<rect x="120" y="404" width="325.9" height="13" fill="#3b6ea5" rx="2"/>
-<text x="450.9" y="414" font-size="10.5" fill="#3b6ea5">3.54x</text>
-<rect x="120" y="419" width="301.1" height="13" fill="#2a9d4a" rx="2"/>
-<text x="426.1" y="429" font-size="10.5" fill="#2a9d4a">3.27x</text>
-<rect x="120" y="434" width="92.0" height="13" fill="#e08a3c" rx="2"/>
-<text x="217.0" y="444" font-size="10.5" fill="#e08a3c">1.00x</text>
-<rect x="120" y="449" width="63.9" height="13" fill="#b5539c" rx="2"/>
-<text x="188.9" y="459" font-size="10.5" fill="#b5539c">0.69x</text>
+<rect x="120" y="404" width="309.0" height="13" fill="#3b6ea5" rx="2"/>
+<text x="434.0" y="414" font-size="10.5" fill="#3b6ea5">3.39x</text>
+<rect x="120" y="419" width="258.6" height="13" fill="#2a9d4a" rx="2"/>
+<text x="383.6" y="429" font-size="10.5" fill="#2a9d4a">2.84x</text>
+<rect x="120" y="434" width="73.4" height="13" fill="#e08a3c" rx="2"/>
+<text x="198.4" y="444" font-size="10.5" fill="#e08a3c">0.81x</text>
+<rect x="120" y="449" width="43.8" height="13" fill="#b5539c" rx="2"/>
+<text x="168.8" y="459" font-size="10.5" fill="#b5539c">0.48x</text>
 <text x="112" y="513" font-size="11" fill="#222222" text-anchor="end">read · text</text>
-<rect x="120" y="479" width="264.9" height="13" fill="#3b6ea5" rx="2"/>
-<text x="389.9" y="489" font-size="10.5" fill="#3b6ea5">2.88x</text>
-<rect x="120" y="494" width="236.9" height="13" fill="#2a9d4a" rx="2"/>
-<text x="361.9" y="504" font-size="10.5" fill="#2a9d4a">2.58x</text>
-<rect x="120" y="509" width="126.5" height="13" fill="#e08a3c" rx="2"/>
-<text x="251.5" y="519" font-size="10.5" fill="#e08a3c">1.38x</text>
-<rect x="120" y="524" width="96.3" height="13" fill="#b5539c" rx="2"/>
-<text x="221.3" y="534" font-size="10.5" fill="#b5539c">1.05x</text>
+<rect x="120" y="479" width="309.8" height="13" fill="#3b6ea5" rx="2"/>
+<text x="434.8" y="489" font-size="10.5" fill="#3b6ea5">3.40x</text>
+<rect x="120" y="494" width="236.8" height="13" fill="#2a9d4a" rx="2"/>
+<text x="361.8" y="504" font-size="10.5" fill="#2a9d4a">2.60x</text>
+<rect x="120" y="509" width="180.1" height="13" fill="#e08a3c" rx="2"/>
+<text x="305.1" y="519" font-size="10.5" fill="#e08a3c">1.98x</text>
+<rect x="120" y="524" width="156.5" height="13" fill="#b5539c" rx="2"/>
+<text x="281.5" y="534" font-size="10.5" fill="#b5539c">1.72x</text>
 </svg>

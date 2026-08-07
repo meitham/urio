@@ -11,12 +11,12 @@ listing and the metadata tweaks fall back to the executor.
 
 from __future__ import annotations
 
-import locale as _locale
-import os as _os
-import pathlib as _pathlib
-import stat as _stat
+import locale
+import os
+import pathlib
+import stat as stat_module
 
-from .backend import get_backend as _get_backend
+from .backend import get_backend
 from .file import open as _async_open
 
 
@@ -28,23 +28,23 @@ class AsyncPath:
             self._path = segments[0]._path
         else:
             parts = [s._path if isinstance(s, AsyncPath) else s for s in segments]
-            self._path = _pathlib.Path(*parts) if parts else _pathlib.Path()
+            self._path = pathlib.Path(*parts) if parts else pathlib.Path()
 
     # -- construction / dunders ------------------------------------------
 
     @classmethod
-    def _wrap(cls, path: _pathlib.Path) -> AsyncPath:
+    def _wrap(cls, path: pathlib.Path) -> AsyncPath:
         obj = cls.__new__(cls)
         obj._path = path
         return obj
 
     @classmethod
     def cwd(cls) -> AsyncPath:
-        return cls._wrap(_pathlib.Path.cwd())
+        return cls._wrap(pathlib.Path.cwd())
 
     @classmethod
     def home(cls) -> AsyncPath:
-        return cls._wrap(_pathlib.Path.home())
+        return cls._wrap(pathlib.Path.home())
 
     def __fspath__(self):
         return str(self._path)
@@ -58,7 +58,7 @@ class AsyncPath:
     def __eq__(self, other):
         if isinstance(other, AsyncPath):
             return self._path == other._path
-        if isinstance(other, _pathlib.PurePath):
+        if isinstance(other, pathlib.PurePath):
             return self._path == other
         return NotImplemented
 
@@ -154,10 +154,10 @@ class AsyncPath:
     # -- filesystem I/O (async) ------------------------------------------
 
     async def stat(self):
-        return await _get_backend().statx(str(self._path), follow=True)
+        return await get_backend().statx(str(self._path), follow=True)
 
     async def lstat(self):
-        return await _get_backend().statx(str(self._path), follow=False)
+        return await get_backend().statx(str(self._path), follow=False)
 
     async def exists(self):
         try:
@@ -168,19 +168,19 @@ class AsyncPath:
 
     async def is_file(self):
         try:
-            return _stat.S_ISREG((await self.stat()).st_mode)
+            return stat_module.S_ISREG((await self.stat()).st_mode)
         except (FileNotFoundError, NotADirectoryError):
             return False
 
     async def is_dir(self):
         try:
-            return _stat.S_ISDIR((await self.stat()).st_mode)
+            return stat_module.S_ISDIR((await self.stat()).st_mode)
         except (FileNotFoundError, NotADirectoryError):
             return False
 
     async def is_symlink(self):
         try:
-            return _stat.S_ISLNK((await self.lstat()).st_mode)
+            return stat_module.S_ISLNK((await self.lstat()).st_mode)
         except (FileNotFoundError, NotADirectoryError):
             return False
 
@@ -196,7 +196,7 @@ class AsyncPath:
     async def read_bytes(self):
         # Backends with linked open→read chains (io_uring) read a whole small
         # file in a single kernel round-trip; others take the classic path.
-        backend = _get_backend()
+        backend = get_backend()
         fast = getattr(backend, 'read_file', None)
         if fast is not None:
             return await fast(str(self._path))
@@ -204,7 +204,7 @@ class AsyncPath:
             return await f.read()
 
     async def write_bytes(self, data):
-        backend = _get_backend()
+        backend = get_backend()
         fast = getattr(backend, 'write_file', None)
         if fast is not None:
             return await fast(str(self._path), bytes(data))
@@ -212,12 +212,12 @@ class AsyncPath:
             return await f.write(data)
 
     async def read_text(self, encoding=None, errors=None):
-        backend = _get_backend()
+        backend = get_backend()
         fast = getattr(backend, 'read_file', None)
         if fast is not None:
             data = await fast(str(self._path))
             if encoding is None:
-                encoding = _locale.getpreferredencoding(False)
+                encoding = locale.getpreferredencoding(False)
             text = data.decode(encoding, errors or 'strict')
             # Universal newlines, matching open(mode='r', newline=None): a
             # whole-file decode + translate equals the incremental path.
@@ -228,14 +228,14 @@ class AsyncPath:
             return await f.read()
 
     async def write_text(self, data, encoding=None, errors=None, newline=None):
-        backend = _get_backend()
+        backend = get_backend()
         fast = getattr(backend, 'write_file', None)
         if fast is not None:
             if not isinstance(data, str):
                 raise TypeError(f'data must be str, not {type(data).__name__}')
             nchars = len(data)
             if newline is None:
-                nl = _os.linesep
+                nl = os.linesep
             elif newline == '':
                 nl = ''
             else:
@@ -243,7 +243,7 @@ class AsyncPath:
             if nl and nl != '\n':
                 data = data.replace('\n', nl)
             if encoding is None:
-                encoding = _locale.getpreferredencoding(False)
+                encoding = locale.getpreferredencoding(False)
             await fast(str(self._path), data.encode(encoding, errors or 'strict'))
             return nchars
         async with _async_open(
@@ -252,7 +252,7 @@ class AsyncPath:
             return await f.write(data)
 
     async def mkdir(self, mode=0o777, parents=False, exist_ok=False):
-        backend = _get_backend()
+        backend = get_backend()
         try:
             await backend.mkdir(str(self._path), mode)
         except FileNotFoundError:
@@ -265,46 +265,46 @@ class AsyncPath:
                 raise
 
     async def rmdir(self):
-        await _get_backend().unlink(str(self._path), remove_dir=True)
+        await get_backend().unlink(str(self._path), remove_dir=True)
 
     async def unlink(self, missing_ok=False):
         try:
-            await _get_backend().unlink(str(self._path), remove_dir=False)
+            await get_backend().unlink(str(self._path), remove_dir=False)
         except FileNotFoundError:
             if not missing_ok:
                 raise
 
     async def rename(self, target):
         target = target._path if isinstance(target, AsyncPath) else target
-        await _get_backend().rename(str(self._path), _os.fspath(target))
-        return self._wrap(_pathlib.Path(target))
+        await get_backend().rename(str(self._path), os.fspath(target))
+        return self._wrap(pathlib.Path(target))
 
     async def replace(self, target):
         # Atomically replace an existing destination. POSIX rename(2) overwrites,
         # but Windows MoveFile (os.rename) fails if the target exists — os.replace
         # does the atomic overwrite on every platform, so route through it.
         target = target._path if isinstance(target, AsyncPath) else target
-        await _get_backend().replace(str(self._path), _os.fspath(target))
-        return self._wrap(_pathlib.Path(target))
+        await get_backend().replace(str(self._path), os.fspath(target))
+        return self._wrap(pathlib.Path(target))
 
     async def symlink_to(self, target, target_is_directory=False):
         target = target._path if isinstance(target, AsyncPath) else target
-        await _get_backend().symlink(_os.fspath(target), str(self._path))
+        await get_backend().symlink(os.fspath(target), str(self._path))
 
     async def hardlink_to(self, target):
         target = target._path if isinstance(target, AsyncPath) else target
-        await _get_backend().link(_os.fspath(target), str(self._path))
+        await get_backend().link(os.fspath(target), str(self._path))
 
     async def touch(self, mode=0o666, exist_ok=True):
         flags = (
-            _os.O_CREAT
-            | _os.O_WRONLY
-            | getattr(_os, 'O_CLOEXEC', 0)
-            | getattr(_os, 'O_BINARY', 0)
+            os.O_CREAT
+            | os.O_WRONLY
+            | getattr(os, 'O_CLOEXEC', 0)
+            | getattr(os, 'O_BINARY', 0)
         )
         if not exist_ok:
-            flags |= _os.O_EXCL
-        backend = _get_backend()
+            flags |= os.O_EXCL
+        backend = get_backend()
         fd = await backend.open(str(self._path), flags, mode)
         await backend.close(fd)
         if exist_ok:
@@ -314,13 +314,13 @@ class AsyncPath:
                 pass
 
     async def chmod(self, mode):
-        await _get_backend().chmod(str(self._path), mode)
+        await get_backend().chmod(str(self._path), mode)
 
     async def readlink(self):
-        return self._wrap(_pathlib.Path(await _get_backend().readlink(str(self._path))))
+        return self._wrap(pathlib.Path(await get_backend().readlink(str(self._path))))
 
     async def resolve(self, strict=False):
-        return self._wrap(_pathlib.Path(await _get_backend().realpath(str(self._path))))
+        return self._wrap(pathlib.Path(await get_backend().realpath(str(self._path))))
 
     def absolute(self):
         return self._wrap(self._path.absolute())
@@ -328,11 +328,11 @@ class AsyncPath:
     async def samefile(self, other):
         other = other._path if isinstance(other, AsyncPath) else other
         a = await self.stat()
-        b = await _get_backend().statx(_os.fspath(other), follow=True)
+        b = await get_backend().statx(os.fspath(other), follow=True)
         return (a.st_ino, a.st_dev) == (b.st_ino, b.st_dev)
 
     async def iterdir(self):
-        names = await _get_backend().scandir(str(self._path))
+        names = await get_backend().scandir(str(self._path))
         for entry in names:
             yield self._wrap(self._path / entry)
 
@@ -369,7 +369,7 @@ class AsyncPath:
             yield self._wrap(dirpath), dirnames, filenames
 
 
-async def _to_thread_glob(path: _pathlib.Path, pattern: str, recursive: bool):
+async def _to_thread_glob(path: pathlib.Path, pattern: str, recursive: bool):
     import asyncio
 
     loop = asyncio.get_running_loop()

@@ -117,7 +117,7 @@ operating on `str`:
 
 ```python
 async with urio.open('f.txt', encoding='utf-8') as f:
-    async for line in f:        # str lines
+    async for line in f:  # str lines
         print(line.rstrip())
 ```
 

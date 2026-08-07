@@ -49,11 +49,14 @@ async def aclose() -> None:
     """Release the running loop's native I/O resources deterministically.
 
     Shuts down whichever driver (io_uring ring + eventfd, or IOCP poller) this
-    loop lazily created, cancelling any still-pending operations. Optional —
-    drivers are also reclaimed when the loop is garbage collected — but useful
-    for embedders that create many loops or want a clean teardown point. urio
-    works again on the same loop afterwards (a fresh driver is created on the
-    next operation).
+    loop lazily created, cancelling any still-pending operations. On Linux this
+    is optional — drivers are also reclaimed when the loop is garbage
+    collected, from any thread — but useful for embedders that create many
+    loops or want a clean teardown point. With the Windows IOCP backend it is
+    the supported teardown for loops running on worker threads: the native port
+    must be released on the thread that created it, which a later GC pass may
+    not honour. urio works again on the same loop afterwards (a fresh driver is
+    created on the next operation).
     """
     loop = _asyncio.get_running_loop()
     for name in ('urio.driver', 'urio.driver_iocp', 'urio.driver_iocp_proactor'):

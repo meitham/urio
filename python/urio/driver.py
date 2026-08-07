@@ -13,12 +13,12 @@ every coroutine running on that loop.
 
 from __future__ import annotations
 
-import asyncio as _asyncio
-import collections as _collections
+import asyncio
+import collections
 import errno as _errno
-import os as _os
-import weakref as _weakref
-from typing import Any as _Any
+import os
+import weakref
+from typing import Any
 
 from . import _uring
 
@@ -31,12 +31,30 @@ _DRIVER_ATTR = '_urio_uring_driver'
 # Fallback for loop implementations that reject attribute assignment: weak
 # *values*, so the only strong holder of the driver is the loop's own reader
 # registration and everything dies with the loop.
-_drivers: _weakref.WeakKeyDictionary = _weakref.WeakKeyDictionary()
+_drivers: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 # Transient submit errors: completions already in flight will drain the CQ and
 # a retry next tick can succeed; anything else is treated as permanent.
 _RETRYABLE = (_errno.EAGAIN, _errno.EBUSY)
 _MAX_FLUSH_RETRIES = 16
+
+# Ring depth (submission-queue entries). 512 balances throughput against the
+# read-buffer high-water mark (buffers are allocated at submission, so depth
+# bounds peak memory on large concurrent reads). URIO_RING_ENTRIES overrides
+# it for high-concurrency small-file workloads; io_uring rounds to a power of
+# two and the kernel caps SQ size at 32768.
+_DEFAULT_ENTRIES = 512
+
+
+def _ring_entries() -> int:
+    raw = os.environ.get('URIO_RING_ENTRIES')
+    if not raw:
+        return _DEFAULT_ENTRIES
+    try:
+        n = int(raw)
+    except ValueError:
+        return _DEFAULT_ENTRIES
+    return min(n, 32768) if n > 0 else _DEFAULT_ENTRIES
 
 
 class _Chain:
@@ -60,12 +78,14 @@ class _Chain:
 class Driver:
     """Bridges one io_uring ring into a single asyncio event loop."""
 
-    def __init__(self, loop: _asyncio.AbstractEventLoop, entries: int = 512):
+    def __init__(self, loop: asyncio.AbstractEventLoop, entries: int | None = None):
+        if entries is None:
+            entries = _ring_entries()
         self._loop = loop
         self._ring = _uring.Ring(entries)
         self._eventfd = self._ring.eventfd
         # user_data -> Future awaiting that completion.
-        self._futures: dict[int, _asyncio.Future] = {}
+        self._futures: dict[int, asyncio.Future] = {}
         self._closed = False
         # Cap simultaneously in-flight submissions to the ring depth so the
         # kernel completion queue (sized >= entries) can never overflow, no
@@ -76,7 +96,7 @@ class Driver:
         # exactly one parked waiter in O(1).
         self._depth = entries
         self._inflight = 0
-        self._waiters: _collections.deque[_asyncio.Future] = _collections.deque()
+        self._waiters: collections.deque[asyncio.Future] = collections.deque()
         # Submissions are queued in the ring but not entered into the kernel
         # immediately; a single flush per event-loop tick coalesces every SQE
         # queued in that tick into one io_uring_enter.
@@ -91,7 +111,7 @@ class Driver:
         self._untracked: set[int] = set()
         # Fixed-file slots for linked open→I/O chains (empty when the kernel
         # lacks sparse fixed-file registration; callers then fall back).
-        self._slots: _collections.deque[int] = _collections.deque(
+        self._slots: collections.deque[int] = collections.deque(
             range(getattr(self._ring, 'fixed_slots', 0))
         )
         # ident -> _Chain for in-flight linked pairs.
@@ -175,10 +195,18 @@ class Driver:
             return
         self._unflushed.clear()
         self._flush_retries = 0
+        # Opportunistic reap: warm-cache completions are often already sitting
+        # in the CQ by the time io_uring_enter returns, so resolve them now
+        # instead of paying a full event-loop wake through the eventfd. The
+        # eventfd still fires for them; that later wake just reaps nothing.
+        self._reap()
 
     def _on_ready(self) -> None:
         """Reader callback: drain the eventfd and resolve completed futures."""
         self._ring.drain_eventfd()
+        self._reap()
+
+    def _reap(self) -> None:
         for ident, result, payload in self._ring.reap():
             if ident in self._untracked:
                 # Fire-and-forget op (AsyncCancel / fixed close): no slot was
@@ -207,14 +235,14 @@ class Driver:
                 continue
             try:
                 if result < 0:
-                    fut.set_exception(OSError(-result, _os.strerror(-result)))
+                    fut.set_exception(OSError(-result, os.strerror(-result)))
                 else:
                     fut.set_result((result, payload))
             except Exception:
                 if not fut.done():
                     fut.cancel()
 
-    def _await_id(self, ident: int) -> _asyncio.Future:
+    def _await_id(self, ident: int) -> asyncio.Future:
         fut = self._loop.create_future()
         self._futures[ident] = fut
         self._unflushed.append(ident)
@@ -236,7 +264,7 @@ class Driver:
         self._untracked.add(cid)
         self._schedule_flush()
 
-    async def _run(self, submit) -> tuple[int, _Any]:
+    async def _run(self, submit) -> tuple[int, Any]:
         """Submit via ``submit`` (returns an id) and await its completion."""
         if self._closed:
             raise RuntimeError('driver is closed')
@@ -252,7 +280,7 @@ class Driver:
         self._schedule_flush()
         try:
             return await self._await_id(ident)
-        except _asyncio.CancelledError:
+        except asyncio.CancelledError:
             self._cancel_op(ident)
             raise
 
@@ -279,7 +307,7 @@ class Driver:
         self._schedule_flush()
         try:
             _, payload = await self._await_id(ident)
-        except _asyncio.CancelledError:
+        except asyncio.CancelledError:
             self._cancel_op(ident)
             raise
         return payload if payload is not None else b''
@@ -304,7 +332,7 @@ class Driver:
         self._schedule_flush()
         try:
             result, _ = await self._await_id(ident)
-        except _asyncio.CancelledError:
+        except asyncio.CancelledError:
             self._cancel_op(ident)
             raise
         return result
@@ -363,13 +391,13 @@ class Driver:
         else:
             self._slots.append(chain.slot)
 
-    def _abandon_chain(self, chain: _Chain, *futs: _asyncio.Future) -> None:
+    def _abandon_chain(self, chain: _Chain, *futs: asyncio.Future) -> None:
         # The awaiter is bailing out (cancellation or a failed half): hand the
         # chain to completion-side cleanup and make sure no unretrieved
         # exception warning fires for the halves nobody will await.
         chain.abandoned = True
 
-        def _swallow(f: _asyncio.Future) -> None:
+        def _swallow(f: asyncio.Future) -> None:
             if not f.cancelled():
                 f.exception()
 
@@ -413,7 +441,7 @@ class Driver:
         self._chains[io_id] = chain
         try:
             await ofut
-        except _asyncio.CancelledError:
+        except asyncio.CancelledError:
             self._abandon_chain(chain, ofut, iofut)
             raise
         except OSError:
@@ -423,7 +451,7 @@ class Driver:
             raise
         try:
             result, payload = await iofut
-        except _asyncio.CancelledError:
+        except asyncio.CancelledError:
             self._abandon_chain(chain, iofut)
             raise
         except OSError:
@@ -522,11 +550,11 @@ class Driver:
                 w.cancel()
 
 
-def get_driver(loop: _asyncio.AbstractEventLoop | None = None) -> Driver:
+def get_driver(loop: asyncio.AbstractEventLoop | None = None) -> Driver:
     """Return the driver for ``loop`` (default: the running loop), creating it
     on first use and caching it for the lifetime of the loop."""
     if loop is None:
-        loop = _asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
     driver = getattr(loop, _DRIVER_ATTR, None)
     if driver is None:
         ref = _drivers.get(loop)
@@ -536,11 +564,11 @@ def get_driver(loop: _asyncio.AbstractEventLoop | None = None) -> Driver:
         try:
             setattr(loop, _DRIVER_ATTR, driver)
         except AttributeError:
-            _drivers[loop] = _weakref.ref(driver)
+            _drivers[loop] = weakref.ref(driver)
     return driver
 
 
-def close_driver(loop: _asyncio.AbstractEventLoop) -> None:
+def close_driver(loop: asyncio.AbstractEventLoop) -> None:
     """Shut down and discard the driver cached on ``loop``, if any."""
     driver = getattr(loop, _DRIVER_ATTR, None)
     if driver is not None:

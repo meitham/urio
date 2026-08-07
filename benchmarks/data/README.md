@@ -39,9 +39,13 @@ Recompute a statistic, e.g. the mean instead of the median:
 
 ```python
 import json, statistics
+
 d = json.load(open('linux-x86_64-3.12-uring.json'))
 for cell in d['matrix']:
     s = cell['samples']
-    print(cell['scenario'], cell['op'],
-          {k: round(statistics.fmean(v) * 1000, 1) for k, v in s.items()})
+    print(
+        cell['scenario'],
+        cell['op'],
+        {k: round(statistics.fmean(v) * 1000, 1) for k, v in s.items()},
+    )
 ```

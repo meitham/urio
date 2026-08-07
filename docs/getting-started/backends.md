@@ -59,13 +59,13 @@ need to intervene, but you can:
 ```python
 import urio
 
-urio.set_backend('auto')     # default: fastest available, else thread
-urio.set_backend('thread')   # force the portable fallback
-urio.set_backend('uring')    # require io_uring (raises if unavailable)
-urio.set_backend('iocp')     # require IOCP (raises unless on Windows with
-                             # URIO_WINDOWS_IOCP=1)
+urio.set_backend('auto')  # default: fastest available, else thread
+urio.set_backend('thread')  # force the portable fallback
+urio.set_backend('uring')  # require io_uring (raises if unavailable)
+urio.set_backend('iocp')  # require IOCP (raises unless on Windows with
+# URIO_WINDOWS_IOCP=1)
 
-print(urio.get_backend().name)   # 'uring', 'iocp', or 'thread'
+print(urio.get_backend().name)  # 'uring', 'iocp', or 'thread'
 ```
 
 Or via the environment, without touching code:
@@ -96,7 +96,7 @@ for explicitly — the variable is the opt-in.
 When the cost is per-operation or waiting, not copying bytes:
 
 - **Many small/medium files at once.** The flagship case. Concurrent 4–64 KB
-  reads run 2.6–3.5× and buffered writes 2.9–5.3× faster than a thread pool: a
+  reads run 2.6–3.4× and buffered writes 3.4–5.2× faster than a thread pool: a
   pool pays a thread round-trip per op and starves under high fan-out, while
   urio batches everything queued in an event-loop tick into a single
   `io_uring_enter` — 500 concurrent open+write+close ops issue ~15 syscalls,
@@ -110,8 +110,8 @@ When the cost is per-operation or waiting, not copying bytes:
   pay the contention. On a 4-core Raspberry Pi the read win *grew* to
   2.2–2.9×. The GIL has the same effect: a GIL-bound pool cannot parallelise
   its copies anyway.
-- **Latency-bound storage.** io_uring hides latency, not bandwidth — cold
-  caches, network filesystems, disks busy with other traffic.
+- **Latency-bound local storage.** io_uring hides latency, not bandwidth —
+  cold caches, disks busy with other traffic.
 
 Numbers and caveats: [the benchmarks](../benchmarks.md).
 
@@ -119,11 +119,27 @@ Numbers and caveats: [the benchmarks](../benchmarks.md).
 
 A few big files, warm cache, plenty of cores. A warm multi-megabyte read is
 just a `memcpy` into Python `bytes`, and a pool runs N of those on N cores
-while one loop thread cannot — concurrent 8 MB warm reads sit around 0.7×
+while one loop thread cannot — concurrent 8 MB warm reads sit around 0.5–0.8×
 even with zero-copy reads. The effect is strongest on free-threaded (no-GIL)
 Python, where the unshackled pool catches up on all warm reads. The thread
 backend tracks aiofiles within noise everywhere, so falling back to it never
 costs you anything.
+
+### What about network filesystems (NFS, SMB/CIFS, 9p, FUSE)?
+
+Kernels mostly lack an asynchronous submission path for network filesystems,
+so io_uring punts each op to kernel worker threads (io-wq) — a thread pool
+again, just inside the kernel. Measured, that does *not* erase the fan-out
+win, it relocates it: on loopback NFSv4.2 and SMB 3.1.1 mounts, concurrent
+small-file reads (200 × 64 KB) still run **2–4.5× faster** than aiofiles —
+warm and cold, GIL and free-threaded, on 4- and 8-core hosts — because
+batched submission still hides the per-file network round-trip. Large-file
+reads (20 × 8 MB) sit at 0.9–1.1× (parity within noise), and durable writes
+keep the batching win (cold `write+fsync` 1.5–3.1× on SMB). The one negative
+report is a 9p mount (~0.7× reads, ~0.5× `exists()`) — exotic transports
+vary, so if your data lives on a network mount, run
+`benchmarks/bench_vs_aiofiles.py` there; the thread backend is one
+`set_backend('thread')` away if it loses.
 
 ### Do I actually have to choose?
 
@@ -143,14 +159,16 @@ carries up to ~32 OS threads and their stacks.
 
 The one case where io_uring's high-water mark is higher: **large concurrent
 reads**. Read buffers are allocated at submission, and the ring admits up to
-its depth (256) ops in flight, where a thread pool implicitly throttles at
-~32 running ops — so 1000 concurrent 8 MB reads can hold ~2 GB of live
-buffers under io_uring versus ~256 MB under the pool. Those 256 in-flight ops
-are also exactly what makes io_uring fast, so this is a queue-depth trade,
-not waste. If it exceeds your RAM budget, bound the fan-out yourself:
+its depth (512 by default, tunable via `URIO_RING_ENTRIES`) ops in flight,
+where a thread pool implicitly throttles at ~32 running ops — so 1000
+concurrent 8 MB reads can hold ~4 GB of live buffers under io_uring versus
+~256 MB under the pool. Those in-flight ops are also exactly what makes
+io_uring fast, so this is a queue-depth trade, not waste. If it exceeds your
+RAM budget, bound the fan-out yourself:
 
 ```python
 sem = asyncio.Semaphore(32)
+
 
 async def read_one(path):
     async with sem:

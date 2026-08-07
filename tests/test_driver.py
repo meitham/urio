@@ -4,7 +4,11 @@
 import asyncio
 import gc
 import os
+import sys
+import threading
 import weakref
+
+import pytest
 
 import urio
 
@@ -90,6 +94,65 @@ def test_driver_collected_after_loop_close(backend, tmp_path):
 
     # then: every driver (and its ring/eventfd) has been reclaimed
     assert all(r() is None for r in refs)
+
+
+def test_loop_gc_on_another_thread_is_silent(backend, tmp_path, monkeypatch):
+    # given: a worker thread that ran urio I/O on its own loop and exited
+    #        without urio.aclose(), the loop kept alive past the thread's death
+    if backend != 'uring':
+        # Only the io_uring ring supports off-thread drops; the IOCP classes
+        # are thread-affine (tear down via urio.aclose() on their own thread)
+        # and the thread backend has no native state to drop.
+        pytest.skip('cross-thread GC of the native ring is uring-specific')
+    from urio.driver import get_driver
+
+    holder = []
+    driver_ref = []
+
+    async def use():
+        holder.append(asyncio.get_running_loop())
+        async with urio.open(tmp_path / 'x', 'wb') as f:
+            await f.write(b'x')
+        driver_ref.append(weakref.ref(get_driver()))
+
+    t = threading.Thread(target=lambda: asyncio.run(use()))
+    t.start()
+    t.join()
+
+    # when: the loop -- and with it the cached driver and native ring -- is
+    #       garbage collected on this thread, not the one that created it
+    #       (an initial collect flushes unrelated garbage from earlier tests
+    #       so the hook captures only what this drop produces)
+    gc.collect()
+    unraisable = []
+    monkeypatch.setattr(sys, 'unraisablehook', lambda args: unraisable.append(args))
+    holder.clear()
+    gc.collect()
+
+    # then: the driver really was collected here, and the off-thread drop of
+    #       its ring raised nothing (no unraisable RuntimeError)
+    assert driver_ref[0]() is None
+    assert unraisable == []
+
+
+@pytest.mark.parametrize(
+    ('raw', 'expected'),
+    (
+        pytest.param('2048', 2048, id='override'),
+        pytest.param('999999', 32768, id='clamped-to-kernel-cap'),
+        pytest.param('0', 512, id='zero-falls-back-to-default'),
+        pytest.param('nope', 512, id='garbage-falls-back-to-default'),
+    ),
+)
+def test_ring_entries_env_knob(monkeypatch, raw, expected):
+    # given: URIO_RING_ENTRIES set in the environment
+    from urio import driver
+
+    monkeypatch.setenv('URIO_RING_ENTRIES', raw)
+
+    # when: the driver resolves its ring depth
+    # then: valid overrides apply (capped), everything else uses the default
+    assert driver._ring_entries() == expected
 
 
 async def test_aclose_releases_driver_and_allows_reuse(backend, tmpfile):

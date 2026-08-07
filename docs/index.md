@@ -7,6 +7,7 @@ IOCP backend and a portable thread-pool fallback behind the same API.
 ```python
 import urio
 
+
 async def main():
     async with urio.open('greeting.txt', 'w') as f:
         await f.write('hello\nworld\n')
@@ -41,7 +42,7 @@ backend, the same approach aiofiles takes.
 - **The familiar file API**: `read`, `readline`, `readlines`, `write`,
   `writelines` (one vectored `writev` per batch), `seek`, `tell`, `truncate`,
   `flush`, async iteration, and both text and binary modes.
-- **Async `pathlib.Path`**: [`urio.Path`](api/path.md) with async `stat`, `mkdir`,
+- **Async `pathlib`**: [`urio.Path`](api/path.md) with async `stat`, `mkdir`,
   `unlink`, `rename`, `symlink_to`,
   `read_text`/`write_text`/`read_bytes`/`write_bytes` (the whole-file helpers
   ride a linked open→I/O chain — one kernel submission per small file),

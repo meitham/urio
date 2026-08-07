@@ -20,7 +20,7 @@ use std::ffi::CString;
 #[cfg(target_os = "linux")]
 use std::io;
 #[cfg(target_os = "linux")]
-use std::os::unix::io::RawFd;
+use std::os::unix::io::{AsRawFd, RawFd};
 
 #[cfg(target_os = "linux")]
 use io_uring::{opcode, squeue, types, IoUring};
@@ -28,60 +28,6 @@ use io_uring::{opcode, squeue, types, IoUring};
 use pyo3::exceptions::PyOSError;
 #[cfg(target_os = "linux")]
 use pyo3::types::{PyBytes, PyTuple};
-
-// The libc crate only defines `statx` for glibc targets. The struct itself is
-// kernel UAPI (linux/stat.h) with a frozen 256-byte layout on every libc, so
-// on musl we carry our own definition and alias to libc's elsewhere. Only the
-// fields up to the dev/rdev pair (first 144 bytes, stable since kernel 4.11)
-// are ever read.
-#[cfg(all(target_os = "linux", not(target_env = "musl")))]
-use libc::{statx, statx_timestamp, AT_STATX_SYNC_AS_STAT, STATX_BASIC_STATS};
-
-// Same story for the statx flag/mask constants: kernel UAPI values, absent
-// from the libc crate on musl.
-#[cfg(all(target_os = "linux", target_env = "musl"))]
-const AT_STATX_SYNC_AS_STAT: libc::c_int = 0;
-#[cfg(all(target_os = "linux", target_env = "musl"))]
-const STATX_BASIC_STATS: libc::c_uint = 0x07ff;
-
-#[cfg(all(target_os = "linux", target_env = "musl"))]
-#[repr(C)]
-#[allow(non_camel_case_types)]
-struct statx_timestamp {
-    tv_sec: i64,
-    tv_nsec: u32,
-    __reserved: i32,
-}
-
-#[cfg(all(target_os = "linux", target_env = "musl"))]
-#[repr(C)]
-#[allow(non_camel_case_types)]
-struct statx {
-    stx_mask: u32,
-    stx_blksize: u32,
-    stx_attributes: u64,
-    stx_nlink: u32,
-    stx_uid: u32,
-    stx_gid: u32,
-    stx_mode: u16,
-    __spare0: [u16; 1],
-    stx_ino: u64,
-    stx_size: u64,
-    stx_blocks: u64,
-    stx_attributes_mask: u64,
-    stx_atime: statx_timestamp,
-    stx_btime: statx_timestamp,
-    stx_ctime: statx_timestamp,
-    stx_mtime: statx_timestamp,
-    stx_rdev_major: u32,
-    stx_rdev_minor: u32,
-    stx_dev_major: u32,
-    stx_dev_minor: u32,
-    stx_mnt_id: u64,
-    stx_dio_mem_align: u32,
-    stx_dio_offset_align: u32,
-    __spare3: [u64; 12],
-}
 
 /// Owned state that must stay alive until a submission completes.
 #[cfg(target_os = "linux")]
@@ -104,12 +50,78 @@ enum Pending {
     // kernel walks — both must outlive the submission.
     Writev {
         _bufs: Vec<Py<PyBytes>>,
-        _iov: Box<[libc::iovec]>,
+        _iov: IovBox,
     },
-    Statx { _path: CString, stx: Box<statx> },
+    Statx { _path: CString, stx: Box<statx_abi::statx> },
     Open { _path: CString },
     Paths { _paths: Vec<CString> },
     Plain,
+}
+
+/// An iovec array for a pending vectored write. `libc::iovec` holds raw
+/// pointers, which strip the auto `Send`/`Sync` impls from anything containing
+/// them — and through `Pending` from `Ring` itself. The pointers here aim into
+/// the immutable `bytes` buffers held alive in the same `Pending::Writev`
+/// entry and are only ever dereferenced by the kernel, so moving or sharing
+/// the array across threads is sound.
+#[cfg(target_os = "linux")]
+struct IovBox(#[allow(dead_code)] Box<[libc::iovec]>);
+
+#[cfg(target_os = "linux")]
+unsafe impl Send for IovBox {}
+#[cfg(target_os = "linux")]
+unsafe impl Sync for IovBox {}
+
+/// statx ABI. The layout and flag values come from the kernel's
+/// include/uapi/linux/stat.h and are stable kernel ABI, but the libc crate
+/// only exposes bindings for them on glibc — musl builds must vendor them.
+/// The glibc arm re-exports libc's definitions so the two arms can never
+/// drift apart in meaning, only in provenance.
+#[cfg(all(target_os = "linux", not(target_env = "musl")))]
+mod statx_abi {
+    pub use libc::{statx, statx_timestamp, AT_STATX_SYNC_AS_STAT, STATX_BASIC_STATS};
+}
+
+#[cfg(all(target_os = "linux", target_env = "musl"))]
+mod statx_abi {
+    pub const STATX_BASIC_STATS: libc::c_uint = 0x07ff;
+    pub const AT_STATX_SYNC_AS_STAT: libc::c_int = 0;
+
+    #[repr(C)]
+    pub struct statx_timestamp {
+        pub tv_sec: i64,
+        pub tv_nsec: u32,
+        pub __reserved: i32,
+    }
+
+    // include/uapi/linux/stat.h `struct statx` — 256 bytes.
+    #[repr(C)]
+    pub struct statx {
+        pub stx_mask: u32,
+        pub stx_blksize: u32,
+        pub stx_attributes: u64,
+        pub stx_nlink: u32,
+        pub stx_uid: u32,
+        pub stx_gid: u32,
+        pub stx_mode: u16,
+        pub __statx_pad1: [u16; 1],
+        pub stx_ino: u64,
+        pub stx_size: u64,
+        pub stx_blocks: u64,
+        pub stx_attributes_mask: u64,
+        pub stx_atime: statx_timestamp,
+        pub stx_btime: statx_timestamp,
+        pub stx_ctime: statx_timestamp,
+        pub stx_mtime: statx_timestamp,
+        pub stx_rdev_major: u32,
+        pub stx_rdev_minor: u32,
+        pub stx_dev_major: u32,
+        pub stx_dev_minor: u32,
+        pub stx_mnt_id: u64,
+        pub stx_dio_mem_align: u32,
+        pub stx_dio_offset_align: u32,
+        pub __statx_pad3: [u64; 12],
+    }
 }
 
 /// Reads at least this large are submitted with IOSQE_ASYNC so their
@@ -124,8 +136,15 @@ const ASYNC_READ_MIN: usize = 1 << 20;
 #[cfg(target_os = "linux")]
 const FIXED_SLOTS: u32 = 512;
 
+// Deliberately NOT `unsendable`: the driver confines each ring to its loop
+// thread, but the *last reference* can be dropped by GC on any thread — e.g.
+// an event loop from `asyncio.run` in a worker thread collected later on the
+// main thread. An unsendable class turns that drop into an unraisable
+// RuntimeError and leaks the ring. Every field is Send + Sync (see `IovBox`),
+// and both `io_uring_enter` and the fd closes in `Drop` are thread-agnostic,
+// so a cross-thread drop is sound.
 #[cfg(target_os = "linux")]
-#[pyclass(unsendable)]
+#[pyclass]
 struct Ring {
     ring: IoUring,
     eventfd: RawFd,
@@ -183,7 +202,7 @@ impl Ring {
         if first.is_err() {
             self.ring.submit()?;
             unsafe { self.ring.submission().push(entry) }
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "submission queue full"))?;
+                .map_err(|_| io::Error::other("submission queue full"))?;
         }
         Ok(())
     }
@@ -209,7 +228,7 @@ impl Ring {
             let mut sq = self.ring.submission();
             sq.push(first)
                 .and_then(|_| sq.push(second))
-                .map_err(|_| io::Error::new(io::ErrorKind::Other, "submission queue full"))?;
+                .map_err(|_| io::Error::other("submission queue full"))?;
         }
         Ok(())
     }
@@ -234,7 +253,7 @@ impl Ring {
 
 #[cfg(target_os = "linux")]
 fn cstring(path: &str) -> PyResult<CString> {
-    CString::new(path.as_bytes()).map_err(|e| oserr(e))
+    CString::new(path.as_bytes()).map_err(oserr)
 }
 
 #[cfg(target_os = "linux")]
@@ -243,6 +262,10 @@ impl Ring {
     #[new]
     #[pyo3(signature = (entries = 256))]
     fn new(entries: u32) -> PyResult<Self> {
+        // Keep the default builder. Cross-thread drop (see `Drop`) relies on
+        // the ring being usable from whatever thread GC runs on; opting into
+        // IORING_SETUP_SINGLE_ISSUER or SQPOLL would silently break that
+        // (enter/reap become issuer-thread-only) — revisit `Drop` first.
         let ring = IoUring::new(entries).map_err(os_ioerr)?;
         // EFD_NONBLOCK so draining never blocks the loop thread; CLOEXEC so the
         // fd does not leak across exec.
@@ -381,8 +404,13 @@ impl Ring {
         let iov_ptr = iov.as_ptr();
         let cnt = iov.len() as u32;
         let owned: Vec<Py<PyBytes>> = bufs.into_iter().map(|b| b.unbind()).collect();
-        self.pending
-            .insert(id, Pending::Writev { _bufs: owned, _iov: iov });
+        self.pending.insert(
+            id,
+            Pending::Writev {
+                _bufs: owned,
+                _iov: IovBox(iov),
+            },
+        );
         let entry = opcode::Writev::new(types::Fd(fd), iov_ptr, cnt)
             .offset(offset)
             .build()
@@ -593,17 +621,17 @@ impl Ring {
         let id = self.alloc_id();
         let cpath = cstring(path)?;
         let path_ptr = cpath.as_ptr();
-        let stx: Box<statx> = Box::new(unsafe { std::mem::zeroed() });
-        let stx_ptr = Box::as_ref(&stx) as *const statx as *mut types::statx;
+        let stx: Box<statx_abi::statx> = Box::new(unsafe { std::mem::zeroed() });
+        let stx_ptr = Box::as_ref(&stx) as *const statx_abi::statx as *mut types::statx;
         let mut flags = if follow {
             0
         } else {
             libc::AT_SYMLINK_NOFOLLOW
         };
-        flags |= AT_STATX_SYNC_AS_STAT;
+        flags |= statx_abi::AT_STATX_SYNC_AS_STAT;
         let entry = opcode::Statx::new(types::Fd(libc::AT_FDCWD), path_ptr, stx_ptr)
             .flags(flags)
-            .mask(STATX_BASIC_STATS)
+            .mask(statx_abi::STATX_BASIC_STATS)
             .build()
             .user_data(id);
         self.pending.insert(id, Pending::Statx { _path: cpath, stx });
@@ -616,12 +644,12 @@ impl Ring {
         let id = self.alloc_id();
         let empty = cstring("")?;
         let path_ptr = empty.as_ptr();
-        let stx: Box<statx> = Box::new(unsafe { std::mem::zeroed() });
-        let stx_ptr = Box::as_ref(&stx) as *const statx as *mut types::statx;
-        let flags = libc::AT_EMPTY_PATH | AT_STATX_SYNC_AS_STAT;
+        let stx: Box<statx_abi::statx> = Box::new(unsafe { std::mem::zeroed() });
+        let stx_ptr = Box::as_ref(&stx) as *const statx_abi::statx as *mut types::statx;
+        let flags = libc::AT_EMPTY_PATH | statx_abi::AT_STATX_SYNC_AS_STAT;
         let entry = opcode::Statx::new(types::Fd(fd), path_ptr, stx_ptr)
             .flags(flags)
-            .mask(STATX_BASIC_STATS)
+            .mask(statx_abi::STATX_BASIC_STATS)
             .build()
             .user_data(id);
         self.pending.insert(id, Pending::Statx { _path: empty, stx });
@@ -755,43 +783,102 @@ impl Ring {
     }
 }
 
+/// `io_uring_enter(2)` flag: wait for / flush completions without submitting.
+/// Kernel-ABI constant (the crate does not re-export it).
+#[cfg(target_os = "linux")]
+const IORING_ENTER_GETEVENTS: u32 = 1;
+
+/// How long `Drop` waits through complete silence before giving up on the
+/// remaining completions and leaking their buffers instead.
+#[cfg(target_os = "linux")]
+const DRAIN_POLL_MS: i32 = 100;
+#[cfg(target_os = "linux")]
+const DRAIN_MAX_SILENT_POLLS: u32 = 50; // ~5 s without a single completion
+
 #[cfg(target_os = "linux")]
 impl Drop for Ring {
     fn drop(&mut self) {
         // The kernel may still be reading from / writing into buffers held in
         // `pending`. Dropping the ring would free those buffers (and unmap the
         // rings) out from under in-flight operations — a use-after-free. Wait
-        // for every outstanding completion before letting the buffers drop.
-        let mut remaining = self.pending.len();
+        // for the outstanding completions before letting the buffers drop.
+        //
+        // Two things this drain must never do:
+        //
+        //  * Submit. SQEs still sitting in the SQ ring were never consumed by
+        //    the kernel — their `io_uring_enter` failed and the driver already
+        //    failed their futures — so entering with `to_submit > 0` here
+        //    would execute ops the application was told had failed, e.g.
+        //    writing a stale payload into an fd number the application closed
+        //    and the OS has since recycled. They die with the ring instead,
+        //    and their buffers are safe to free: the kernel never saw them.
+        //
+        //  * Wait forever. An op stuck on a hung mount (NFS, 9p) would
+        //    otherwise block whichever thread runs GC — possibly the main
+        //    thread at interpreter exit. After ~5 s with no completion at all
+        //    the remaining buffers are deliberately leaked: the kernel may
+        //    still write into them, so leaking is the only safe way out.
+        let queued = {
+            let mut sq = self.ring.submission();
+            sq.sync();
+            sq.len()
+        };
+        let mut remaining = self.pending.len().saturating_sub(queued);
+        let mut silent_polls = 0u32;
         while remaining > 0 {
-            match self.ring.submit_and_wait(1) {
-                Ok(_) => {}
-                Err(e) if e.raw_os_error() == Some(libc::EINTR) => continue,
-                // Only give up on a non-transient error — freeing the buffers
-                // here while the kernel still owns them would be a use-after-free,
-                // so we prefer to drain even at the cost of a brief stall.
-                Err(_) => break,
-            }
+            // GETEVENTS with to_submit == 0 and min_complete == 0: flush any
+            // overflowed CQEs into the ring without submitting or blocking.
+            // Best-effort — if it fails, the poll below still sees ordinary
+            // completions and the silence cap bounds the wait.
+            let _ = unsafe {
+                self.ring
+                    .submitter()
+                    .enter::<libc::sigset_t>(0, 0, IORING_ENTER_GETEVENTS, None)
+            };
             let mut completed = 0usize;
-            let mut cq = self.ring.completion();
-            cq.sync();
-            for _ in &mut cq {
-                completed += 1;
+            {
+                let mut cq = self.ring.completion();
+                cq.sync();
+                for _ in &mut cq {
+                    completed += 1;
+                }
             }
-            remaining = remaining.saturating_sub(completed);
+            if completed > 0 {
+                remaining = remaining.saturating_sub(completed);
+                silent_polls = 0;
+                continue;
+            }
+            if silent_polls >= DRAIN_MAX_SILENT_POLLS {
+                std::mem::forget(std::mem::take(&mut self.pending));
+                break;
+            }
+            // The ring fd polls readable when the CQ is non-empty.
+            let mut pfd = libc::pollfd {
+                fd: self.ring.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let rc = unsafe { libc::poll(&mut pfd, 1, DRAIN_POLL_MS) };
+            if rc == 0 {
+                silent_polls += 1;
+            } else if rc < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                // Cannot even wait any more; leaking beats a use-after-free.
+                std::mem::forget(std::mem::take(&mut self.pending));
+                break;
+            }
         }
         unsafe { libc::close(self.eventfd) };
     }
 }
 
 #[cfg(target_os = "linux")]
-fn ts_ns(t: &statx_timestamp) -> i64 {
+fn ts_ns(t: &statx_abi::statx_timestamp) -> i64 {
     t.tv_sec * 1_000_000_000 + t.tv_nsec as i64
 }
 
 /// Build the statx payload tuple consumed by `urio.backend`.
 #[cfg(target_os = "linux")]
-fn statx_tuple(py: Python<'_>, s: &statx) -> PyResult<Py<PyAny>> {
+fn statx_tuple(py: Python<'_>, s: &statx_abi::statx) -> PyResult<Py<PyAny>> {
     let dev = libc::makedev(s.stx_dev_major, s.stx_dev_minor);
     let rdev = libc::makedev(s.stx_rdev_major, s.stx_rdev_minor);
     // 13 fields exceeds PyO3's tuple-conversion arity, and the values are mixed
@@ -1162,7 +1249,7 @@ mod iocp {
             id
         }
 
-        fn shutdown(&mut self, py: Python<'_>) {
+        fn shutdown(&mut self) {
             unsafe {
                 PostQueuedCompletionStatus(
                     self.port as *mut c_void,
@@ -1172,13 +1259,7 @@ mod iocp {
                 );
             }
             if let Some(j) = self.poller.take() {
-                // Joining while attached to the interpreter deadlocks: the
-                // poller may still need the GIL (Python::attach) to deliver a
-                // final batch before it sees the sentinel, while this thread
-                // holds it for the duration of the join. Detach for the wait.
-                py.detach(|| {
-                    let _ = j.join();
-                });
+                let _ = j.join();
             }
             unsafe {
                 CloseHandle(self.port as *mut c_void);
@@ -1188,22 +1269,8 @@ mod iocp {
 
     impl Drop for Iocp {
         fn drop(&mut self) {
-            // Same sequence as `shutdown`, minus the detach (no Python token
-            // here). Safe against the shutdown deadlock in the common case:
-            // poll_loop handles a sentinel-only wake without touching the GIL.
-            if let Some(j) = self.poller.take() {
-                unsafe {
-                    PostQueuedCompletionStatus(
-                        self.port as *mut c_void,
-                        0,
-                        SHUTDOWN_KEY,
-                        std::ptr::null(),
-                    );
-                }
-                let _ = j.join();
-                unsafe {
-                    CloseHandle(self.port as *mut c_void);
-                }
+            if self.poller.is_some() {
+                self.shutdown();
             }
         }
     }
@@ -1234,31 +1301,15 @@ mod iocp {
                 // (e.g. the port closed during shutdown) as a stop.
                 break;
             }
-            // Scan for the shutdown sentinel before touching Python: a
-            // sentinel-only wake must not require the GIL, because the thread
-            // requesting shutdown may be holding it while it joins us.
             let mut shutdown = false;
-            let mut real_ops = false;
-            for entry in &entries[..removed as usize] {
-                if entry.lpOverlapped.is_null() {
-                    // The shutdown sentinel is posted with a null overlapped.
-                    if entry.lpCompletionKey == SHUTDOWN_KEY {
-                        shutdown = true;
-                    }
-                } else {
-                    real_ops = true;
-                }
-            }
-            if !real_ops {
-                if shutdown {
-                    break;
-                }
-                continue;
-            }
             Python::attach(|py| {
                 let batch = PyList::empty(py);
                 for entry in &entries[..removed as usize] {
                     if entry.lpOverlapped.is_null() {
+                        // The shutdown sentinel is posted with a null overlapped.
+                        if entry.lpCompletionKey == SHUTDOWN_KEY {
+                            shutdown = true;
+                        }
                         continue;
                     }
                     let mut op = unsafe { Box::from_raw(entry.lpOverlapped as *mut Op) };
@@ -1562,10 +1613,14 @@ mod iocp {
     }
 }
 
-// gil_used = false: the module is safe on free-threaded (no-GIL) CPython. The
-// three native classes are all `#[pyclass(unsendable)]`, so PyO3 confines each
-// ring/port to its creating thread (urio uses one driver per event loop); there
-// is no shared native mutable state across threads.
+// gil_used = false: the module is safe on free-threaded (no-GIL) CPython.
+// urio creates one driver per event loop, so no ring/port is ever *used* from
+// two threads. `Ring` is Send + Sync (not unsendable) purely so the loop's GC
+// finalisation can drop it from a different thread; concurrent method calls
+// would hit PyO3's runtime borrow check, not native state. The two Windows
+// classes remain `#[pyclass(unsendable)]` (their state holds a RefCell and
+// port handles reaped by a specific thread), so on Windows a driver must be
+// torn down on its own thread — `urio.aclose()` before the loop dies.
 #[pymodule(gil_used = false)]
 fn _uring(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // The Ring class only exists on Linux; the Iocp class only on Windows.

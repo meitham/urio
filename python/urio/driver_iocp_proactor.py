@@ -16,8 +16,8 @@ matching future on the loop thread.
 
 from __future__ import annotations
 
-import asyncio as _asyncio
-import weakref as _weakref
+import asyncio
+import weakref
 
 from . import _uring
 
@@ -26,7 +26,7 @@ from . import _uring
 # the loop, keeping the key alive). The dict is only a weak-value fallback for
 # loops that reject attribute assignment.
 _DRIVER_ATTR = '_urio_proactor_driver'
-_drivers: _weakref.WeakKeyDictionary = _weakref.WeakKeyDictionary()
+_drivers: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
 
 class _Ov:
@@ -58,7 +58,7 @@ class _Ov:
 class ProactorDriver:
     """Bridges urio's file ops onto a running ``ProactorEventLoop``'s IOCP."""
 
-    def __init__(self, loop: _asyncio.AbstractEventLoop) -> None:
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
         self._proactor = loop._proactor  # type: ignore[attr-defined]
         self._io = _uring.ProactorIo(self._proactor._iocp)
@@ -92,10 +92,10 @@ class ProactorDriver:
 
 
 def get_proactor_driver(
-    loop: _asyncio.AbstractEventLoop | None = None,
+    loop: asyncio.AbstractEventLoop | None = None,
 ) -> ProactorDriver:
     if loop is None:
-        loop = _asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
     driver = getattr(loop, _DRIVER_ATTR, None)
     if driver is None:
         ref = _drivers.get(loop)
@@ -105,11 +105,11 @@ def get_proactor_driver(
         try:
             setattr(loop, _DRIVER_ATTR, driver)
         except AttributeError:
-            _drivers[loop] = _weakref.ref(driver)
+            _drivers[loop] = weakref.ref(driver)
     return driver
 
 
-def close_driver(loop: _asyncio.AbstractEventLoop) -> None:
+def close_driver(loop: asyncio.AbstractEventLoop) -> None:
     """Discard the driver cached on ``loop``, if any (the proactor's IOCP is
     owned by the loop itself; there is nothing else to tear down)."""
     driver = getattr(loop, _DRIVER_ATTR, None)

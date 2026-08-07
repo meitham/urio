@@ -8,6 +8,7 @@ Everything in urio is `async`. Run the examples below inside an event loop
 ```python
 import urio
 
+
 async def main():
     async with urio.open('notes.txt', 'w') as f:
         await f.write('first line\n')
@@ -34,7 +35,7 @@ async with urio.open('data.bin', 'wb') as f:
 
 async with urio.open('data.bin', 'rb') as f:
     await f.seek(2)
-    print(await f.read(2))   # b'\x02\x03'
+    print(await f.read(2))  # b'\x02\x03'
 ```
 
 ## Awaiting open instead of `async with`
@@ -55,12 +56,13 @@ finally:
 ```python
 from urio import Path
 
+
 async def main():
     p = Path('project') / 'README.md'
     await p.parent.mkdir(parents=True, exist_ok=True)
     await p.write_text('# Project\n')
 
-    print(await p.exists())          # True
+    print(await p.exists())  # True
     print((await p.stat()).st_size)  # 10
     async for child in p.parent.iterdir():
         print(child.name)
@@ -75,9 +77,11 @@ operation, large fan-out workloads scale well:
 import asyncio
 import urio
 
+
 async def save(i):
     async with urio.open(f'out/{i}.txt', 'w') as f:
         await f.write(f'record {i}\n')
+
 
 async def main():
     await asyncio.gather(*(save(i) for i in range(1000)))

@@ -59,9 +59,11 @@ before the Python side sees it.
 import asyncio
 import urio
 
+
 async def main():
     print('urio', urio.__version__)
-    print('backend:', urio.get_backend().name)   # 'uring', 'iocp', or 'thread'
+    print('backend:', urio.get_backend().name)  # 'uring', 'iocp', or 'thread'
+
 
 asyncio.run(main())
 ```

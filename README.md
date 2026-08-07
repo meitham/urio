@@ -1,8 +1,5 @@
 # urio
 
-[![PyPI](https://img.shields.io/pypi/v/urio)](https://pypi.org/project/urio/)
-[![Documentation](https://readthedocs.org/projects/urio/badge/?version=latest)](https://urio.readthedocs.io/en/latest/)
-
 Async file I/O for Python that is actually asynchronous.
 
 On Linux, urio submits reads and writes through
@@ -25,7 +22,7 @@ the builtin `open()`), so switching is mostly changing the import.
 - The familiar file API: `read`, `readline`, `readlines`, `write`,
   `writelines`, `seek`, `tell`, `truncate`, `flush`, async iteration, text and
   binary modes.
-- An async `pathlib.Path`: `urio.Path` with async `stat`, `mkdir`, `unlink`,
+- An async `pathlib`: `urio.Path` with async `stat`, `mkdir`, `unlink`,
   `rename`, `symlink_to`, `read_text`/`write_text`/`read_bytes`/`write_bytes`,
   `iterdir`, `glob`, `walk`, and the full set of pure-path helpers.
 - A thread-pool fallback wherever native async I/O is unavailable, same API.
@@ -118,10 +115,10 @@ use the thread pool.
 urio picks the fastest available backend at runtime. You can force one:
 
 ```python
-urio.set_backend('auto')     # default
-urio.set_backend('thread')   # force the thread pool
-urio.set_backend('uring')    # require io_uring (raises if unavailable)
-urio.set_backend('iocp')     # require IOCP (Windows, needs URIO_WINDOWS_IOCP=1)
+urio.set_backend('auto')  # default
+urio.set_backend('thread')  # force the thread pool
+urio.set_backend('uring')  # require io_uring (raises if unavailable)
+urio.set_backend('iocp')  # require IOCP (Windows, needs URIO_WINDOWS_IOCP=1)
 ```
 
 or via the environment: `URIO_BACKEND=thread python app.py`. On Windows,
@@ -196,12 +193,14 @@ IOCP large-text-read wins drop below parity without the GIL:
 Summary vs aiofiles (medians, CPython 3.14):
 
 - Linux writes win at small/medium sizes through submission batching
-  (2.9–5.3×); large binary writes ride zero-copy submission (1.5× at 1 MB,
-  parity at 8 MB), large text trails.
-- Linux reads win small/medium (2.6–3.5×) and, with zero-copy reads plus the
-  io-wq punt, hold parity at 1 MB and 0.7× at 8 MB; large text reads win
-  (1.1–1.4×). Warm streaming is a clear win — binary 6.4 GB/s vs aiofiles's
-  3.3 (1.9×).
+  (3.4–5.2×); large binary writes ride zero-copy submission (1.7× at 1 MB,
+  parity at 8 MB). Large text writes still trail (0.6–0.7×), though offloading
+  multi-megabyte encodes off the loop roughly halved the gap in 0.2.0.
+- Linux reads win small/medium (2.6–3.4×); with zero-copy reads plus the
+  io-wq punt, large binary sits at 0.8× (1 MB) and 0.5× (8 MB) under the GIL —
+  and flips to a 1.2× win at 8 MB without it — while large text reads win
+  outright (1.7–2.0×). Warm streaming is a clear win — binary 6.3 GB/s vs
+  aiofiles's 3.1 (2.0×).
 - Durable (`fsync`) writes converge on disk bandwidth and are competitive on
   both io_uring and IOCP. On ZFS every `fsync` forces a ZIL/txg commit, so
   large durable writes get ~24–71× slower — but aiofiles pays the same tax
@@ -213,6 +212,12 @@ Summary vs aiofiles (medians, CPython 3.14):
 - The thread backend tracks aiofiles on both reads and writes, on every OS and
   in both GIL states — same strategy, used wherever io_uring or IOCP is
   unavailable or not selected.
+- Network filesystems (measured on loopback NFSv4 and SMB 3.1.1 mounts): the
+  small-file fan-out read win survives — 2–4.5× vs aiofiles, warm and cold —
+  because batching still hides per-file round-trips even though the kernel
+  punts network-FS I/O to worker threads; large-file reads drop to parity
+  (0.9–1.1×). A 9p mount was reported slower (~0.7×), so benchmark unusual
+  transports before adopting.
 
 Run it yourself: `python benchmarks/bench_vs_aiofiles.py --markdown --json out.json`
 (medians + raw samples). Methodology and full tables are in the
@@ -220,11 +225,9 @@ Run it yourself: `python benchmarks/bench_vs_aiofiles.py --markdown --json out.j
 
 ## Documentation
 
-The full documentation lives at
-[urio.readthedocs.io](https://urio.readthedocs.io/).
 [ARCHITECTURE.md](ARCHITECTURE.md) is the code-reader's tour: the ring/eventfd
-bridge, the zero-copy rules, linked chains, and the backend stack. To build
-the site locally:
+bridge, the zero-copy rules, linked chains, and the backend stack. The full
+site is built with MkDocs Material:
 
 ```bash
 pip install -e ".[docs]"

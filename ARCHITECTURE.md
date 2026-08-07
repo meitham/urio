@@ -45,8 +45,11 @@ A `Ring` (and its `Driver`) is created lazily per event loop and cached **as an
 attribute of the loop object**, so its lifetime is exactly the loop's — a
 finished loop releases its ring, eventfd, and any fixed-file table with it.
 (`await urio.aclose()` tears it down deterministically; the next operation
-creates a fresh one.) Rings are never shared across threads: the pyclass is
-`unsendable`, and everything below happens on the loop thread.
+creates a fresh one.) Rings are never shared across threads — one driver per
+loop, and everything below happens on the loop thread. The class is still
+`Send`, though: a loop created inside a worker thread is often garbage-collected
+later on a *different* thread, and dropping the ring there must be (and is)
+safe and silent.
 
 The completion path is eventfd-driven, no polling thread anywhere:
 

@@ -1,7 +1,7 @@
 # `urio.Path`
 
 ```python
-from urio import Path        # alias of urio.AsyncPath
+from urio import Path  # alias of urio.AsyncPath
 ```
 
 An async counterpart to `pathlib.Path`. **Pure-path** operations (those that
@@ -26,32 +26,15 @@ print(await p.exists(), (await p.stat()).st_size)
 ## Construction
 
 ```python
-Path('a', 'b', 'c')      # joins segments, like pathlib.Path
-Path(other_async_path)   # wraps/copies another urio.Path
-Path('/abs') / 'rel'     # the / operator joins (sync)
+Path('a', 'b', 'c')  # joins segments, like pathlib.Path
+Path(other_async_path)  # wraps/copies another urio.Path
+Path('/abs') / 'rel'  # the / operator joins (sync)
 ```
 
 `urio.Path` interoperates with the rest of Python: `str(p)`, `os.fspath(p)`, and
 `repr(p)` all work, and a `urio.Path` compares/hashes equal to the
 `pathlib.Path` for the same string, so you can pass it straight to `urio.open`
 or any stdlib function expecting a path.
-
-## Why a single class?
-
-`pathlib` ships six classes, but they split along one line: the **pure**
-classes (`PurePath`, `PurePosixPath`, `PureWindowsPath`) do no I/O — they
-exist so you can manipulate foreign-flavour paths, like building a Windows
-path on a Linux server — while `Path` does the I/O, instantiating as
-`PosixPath` or `WindowsPath` for the running OS (pathlib refuses to create
-the off-OS one, since its I/O couldn't work).
-
-Only the I/O half has anything to make async, so urio mirrors only `Path`.
-There is deliberately no `AsyncPureWindowsPath`: pure path algebra has
-nothing to await, and pathlib already does it perfectly — use pathlib's pure
-classes and pass the result to `urio.Path` (it accepts any `str` or
-`os.PathLike`, and wraps a native `pathlib.Path` underneath, so per-OS
-flavour behaviour is inherited rather than reimplemented). `trio.Path` and
-`anyio.Path` make the same choice.
 
 ---
 

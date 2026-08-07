@@ -14,50 +14,51 @@ import pathlib
 OUT = pathlib.Path(__file__).resolve().parent.parent / 'docs' / 'assets'
 
 # (scenario label, urio[uring] ms, urio[thread] ms, aiofiles ms)
-# Warm cache, MEDIAN of 7 runs on a Linux 4-core i5-6500, kernel 7.0, ext4-on-HDD
-# box, CPython 3.14.6; reproduce with `bench_vs_aiofiles.py --markdown --json out.json`.
+# Warm cache, MEDIAN of 5 runs on a Linux 4-core i5-6500, kernel 7.0, ext4-on-HDD
+# box, CPython 3.14.6, urio 0.2.0; reproduce with
+# `bench_vs_aiofiles.py --markdown --json out.json`.
 READS = [
-    ('binary 4 KB', 81, 307, 287),
-    ('binary 64 KB', 22, 71, 72),
-    ('binary 1 MB', 26, 25, 26),
-    ('binary 8 MB', 36, 23, 25),
-    ('text 4 KB', 100, 324, 288),
-    ('text 64 KB', 33, 81, 85),
-    ('text 1 MB', 56, 82, 77),
-    ('text 8 MB', 106, 149, 111),
+    ('binary 4 KB', 84, 299, 285),
+    ('binary 64 KB', 25, 75, 71),
+    ('binary 1 MB', 36, 28, 29),
+    ('binary 8 MB', 52, 23, 25),
+    ('text 4 KB', 92, 309, 313),
+    ('text 64 KB', 35, 86, 91),
+    ('text 1 MB', 44, 89, 87),
+    ('text 8 MB', 78, 145, 134),
 ]
 WRITES = [
-    ('binary 4 KB', 76, 271, 280),
-    ('binary 64 KB', 14, 56, 74),
-    ('binary 1 MB', 17, 25, 25),
-    ('binary 8 MB', 23, 23, 23),
-    ('text 4 KB', 108, 279, 314),
-    ('text 64 KB', 21, 65, 78),
-    ('text 1 MB', 50, 62, 35),
-    ('text 8 MB', 136, 110, 38),
+    ('binary 4 KB', 72, 286, 293),
+    ('binary 64 KB', 14, 67, 73),
+    ('binary 1 MB', 15, 26, 25),
+    ('binary 8 MB', 23, 25, 26),
+    ('text 4 KB', 83, 328, 283),
+    ('text 64 KB', 21, 68, 77),
+    ('text 1 MB', 55, 69, 34),
+    ('text 8 MB', 52, 83, 38),
 ]
 FSYNC = [
-    ('binary 4 KB', 94, 323, 423),
-    ('binary 64 KB', 17, 70, 99),
-    ('binary 1 MB', 16, 28, 32),
-    ('binary 8 MB', 24, 25, 25),
-    ('text 4 KB', 114, 332, 441),
-    ('text 64 KB', 23, 79, 106),
-    ('text 1 MB', 48, 65, 42),
-    ('text 8 MB', 115, 110, 40),
+    ('binary 4 KB', 86, 419, 434),
+    ('binary 64 KB', 17, 80, 100),
+    ('binary 1 MB', 16, 30, 31),
+    ('binary 8 MB', 24, 25, 24),
+    ('text 4 KB', 103, 429, 426),
+    ('text 64 KB', 25, 108, 103),
+    ('text 1 MB', 52, 72, 40),
+    ('text 8 MB', 66, 84, 38),
 ]
 # Cold cache (page cache evicted before each read), binary, median of 5.
 COLD_READS = [
-    ('binary 4 KB', 92, 269, 283),
-    ('binary 64 KB', 32, 72, 72),
-    ('binary 1 MB', 37, 31, 28),
-    ('binary 8 MB', 39, 21, 25),
-    ('128 MB stream', 22, 44, 43),
+    ('binary 4 KB', 78, 280, 264),
+    ('binary 64 KB', 28, 77, 72),
+    ('binary 1 MB', 39, 31, 30),
+    ('binary 8 MB', 53, 25, 24),
+    ('128 MB stream', 19, 54, 51),
 ]
-# (mode, urio[uring] MB/s, urio[thread] MB/s, aiofiles MB/s), warm, median of 7.
+# (mode, urio[uring] MB/s, urio[thread] MB/s, aiofiles MB/s), warm, median of 5.
 STREAM = [
-    ('binary', 6447, 3471, 3329),
-    ('text', 2249, 1814, 1783),
+    ('binary', 6255, 2958, 3108),
+    ('text', 1860, 1582, 1738),
 ]
 
 # Windows IOCP: (label, urio[iocp] ms, thread ms, aiofiles ms). MEDIAN of 5 on
@@ -104,15 +105,16 @@ WIN_READS = [
 # backend) copy+decode across all cores and the edge erodes — on both backends.
 
 # Linux io_uring warm binary reads · CPython 3.14.6 vs 3.14.6t (matched build),
-# median of 7 on the Linux 4-core i5-6500, kernel 7.0 box. speedup = aiofiles /
+# median of 5 on the Linux 4-core i5-6500, kernel 7.0 box. speedup = aiofiles /
 # urio[uring]. Small-read wins narrow under no-GIL (aiofiles copies across
-# cores) but stay wins; large reads — zero-copy handoff + io-wq punt — hold
-# ~parity or better in both GIL states.
+# cores) but stay wins; large reads flip the other way — 8 MB loses under the
+# GIL (one loop thread against a pool) but WINS without it (zero-copy handoff
+# + io-wq punt spread the copies just as well).
 NOGIL_URING_READS = [
-    ('binary 4 KB', 3.53, 2.21),
-    ('binary 64 KB', 3.23, 1.55),
-    ('binary 1 MB', 0.99, 1.20),
-    ('binary 8 MB', 0.69, 0.92),
+    ('binary 4 KB', 3.40, 2.24),
+    ('binary 64 KB', 2.88, 1.60),
+    ('binary 1 MB', 0.81, 0.97),
+    ('binary 8 MB', 0.49, 1.22),
 ]
 # Windows IOCP (zero-copy) · CPython 3.14 vs 3.14t · speedup aiofiles / urio[iocp],
 # median of 5. Binary reads lose in both GIL states (inline loop-thread copy);
@@ -524,7 +526,7 @@ def main() -> None:
     # Three dense charts, one per platform/topic, rather than a dozen small ones.
     grouped_speedup_chart(
         'Linux · io_uring vs aiofiles',
-        'Linux · io_uring · CPython 3.14 · median of 7',
+        'Linux · io_uring · CPython 3.14 · median of 5',
         _SPEEDUP_SUB,
         OP_GROUPS,
         _op_matrix(WRITES, FSYNC, READS),

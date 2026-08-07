@@ -13,12 +13,12 @@ Operations the io_uring crate does not cover (``ftruncate``, ``scandir``,
 
 from __future__ import annotations
 
-import asyncio as _asyncio
-import errno as _errno
-import functools as _functools
-import io as _io
-import os as _os
-import sys as _sys
+import asyncio
+import errno
+import functools
+import io
+import os
+import sys
 
 # Resolved lazily so importing urio never fails on a platform without the
 # native module.
@@ -33,7 +33,7 @@ def _native_ok() -> bool:
     if _NATIVE_CHECKED:
         return _NATIVE_OK
     _NATIVE_CHECKED = True
-    if _sys.platform != 'linux':
+    if sys.platform != 'linux':
         _NATIVE_OK = False
         return False
     try:
@@ -56,7 +56,7 @@ def _native_ok() -> bool:
 
 
 async def _to_thread(fn, *args):
-    loop = _asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, fn, *args)
 
 
@@ -65,10 +65,10 @@ async def _to_thread(fn, *args):
 # fd (seek/read/write) after the awaiting task has moved on — so close() must
 # drain these before releasing the fd, or the OS may recycle the fd number for
 # a new open() and the stale job will corrupt the new file's position.
-_orphans: dict[int, set[_asyncio.Future]] = {}
+_orphans: dict[int, set[asyncio.Future]] = {}
 
 
-def _reap_orphan(fd: int, fut: _asyncio.Future) -> None:
+def _reap_orphan(fd: int, fut: asyncio.Future) -> None:
     s = _orphans.get(fd)
     if s is not None:
         s.discard(fut)
@@ -85,15 +85,26 @@ async def _to_thread_fd(fd, fn, *args):
     freeing the fd. The executor future is shielded because cancelling it
     only cancels the proxy — the worker-thread job runs to completion
     regardless, and the proxy must stay awaitable so close() can wait."""
-    loop = _asyncio.get_running_loop()
+    loop = asyncio.get_running_loop()
     fut = loop.run_in_executor(None, fn, *args)
     try:
-        return await _asyncio.shield(fut)
-    except _asyncio.CancelledError:
+        return await asyncio.shield(fut)
+    except asyncio.CancelledError:
         if not fut.done():
             _orphans.setdefault(fd, set()).add(fut)
             fut.add_done_callback(lambda f, fd=fd: _reap_orphan(fd, f))
         raise
+
+
+async def _drain_orphans(fd: int) -> None:
+    """Wait out any cancelled-but-running executor jobs that still use ``fd``.
+    Every backend's ``close`` calls this first — including the native ones,
+    whose inherited/fallback operations (ftruncate, writev, filesize, …) may
+    have parked jobs here — so the fd number can never be recycled while a
+    stale job could still seek/read/write it."""
+    orphans = _orphans.pop(fd, None)
+    if orphans:
+        await asyncio.gather(*orphans, return_exceptions=True)
 
 
 _READ_CHUNK = 1 << 20
@@ -107,18 +118,18 @@ _READ_FIRST = 128 * 1024
 # os.pread/os.pwrite are POSIX-only. On Windows (where the thread backend is the
 # default) emulate them with lseek + read/write. Each file object serialises its
 # own operations and concurrent ops use distinct fds, so the seek is safe.
-if hasattr(_os, 'pread'):
-    _pread = _os.pread
-    _pwrite = _os.pwrite
+if hasattr(os, 'pread'):
+    _pread = os.pread
+    _pwrite = os.pwrite
 
     def _append_write(fd: int, data: bytes) -> int:
         # os.write honours O_APPEND (atomic write at end); fast on POSIX.
-        return _os.write(fd, data)
+        return os.write(fd, data)
 else:
 
     def _pread(fd: int, n: int, offset: int) -> bytes:
-        _os.lseek(fd, offset, _os.SEEK_SET)
-        return _os.read(fd, n)
+        os.lseek(fd, offset, os.SEEK_SET)
+        return os.read(fd, n)
 
     def _fileio_write(fd: int, data: bytes) -> int:
         # Windows os.write() is ~7x slower than io.FileIO.write() for large
@@ -127,14 +138,14 @@ else:
         # aiofiles' buffered writer instead of trailing it. 'w' does not
         # truncate when wrapping an existing fd, so bytes before the seek
         # position survive. closefd=False leaves the fd for the backend to close.
-        f = _io.FileIO(fd, 'w', closefd=False)
+        f = io.FileIO(fd, 'w', closefd=False)
         try:
             return f.write(data)
         finally:
             f.close()
 
     def _pwrite(fd: int, data: bytes, offset: int) -> int:
-        _os.lseek(fd, offset, _os.SEEK_SET)
+        os.lseek(fd, offset, os.SEEK_SET)
         return _fileio_write(fd, data)
 
     def _append_write(fd: int, data: bytes) -> int:
@@ -144,7 +155,7 @@ else:
 
 # os.fdatasync exists only on platforms with the fdatasync(2) syscall (Linux and
 # some Unixes); macOS and Windows have os.fsync only.
-_fdatasync = getattr(_os, 'fdatasync', _os.fsync)
+_fdatasync = getattr(os, 'fdatasync', os.fsync)
 
 
 def _read_all(fd: int, offset: int) -> bytes:
@@ -155,15 +166,36 @@ def _read_all(fd: int, offset: int) -> bytes:
     (on Windows ~4x, enough to beat aiofiles' buffered ``read()``), correctly
     handles short reads, and avoids the extra EOF read the loop paid per call.
     ``closefd=False`` leaves the fd open for the backend to close as usual."""
-    _os.lseek(fd, offset, _os.SEEK_SET)
-    reader = _io.FileIO(fd, mode='r', closefd=False)
+    os.lseek(fd, offset, os.SEEK_SET)
+    reader = io.FileIO(fd, mode='r', closefd=False)
     try:
         return reader.readall()
     finally:
         reader.close()
 
 
-def _stat_from_tuple(t: tuple) -> _os.stat_result:
+async def _drain_to_eof(read, pos: int, parts: list) -> None:
+    """Extend ``parts`` with whatever lies past ``pos`` until a genuinely
+    empty read (short reads are not EOF, and the file may have grown since it
+    was sized). Probe with a single byte first: the overwhelmingly common
+    outcome is that we are already at EOF, and a 1-byte probe avoids
+    allocating — and immediately discarding — a 1 MiB zero-copy buffer per
+    file. Only when the file actually grew does the drain fall back to
+    ring-sized chunks."""
+    probe = await read(pos, 1)
+    if not probe:
+        return
+    parts.append(probe)
+    pos += len(probe)
+    while True:
+        chunk = await read(pos, _READ_CHUNK)
+        if not chunk:
+            return
+        parts.append(chunk)
+        pos += len(chunk)
+
+
+def _stat_from_tuple(t: tuple) -> os.stat_result:
     """Build an :class:`os.stat_result` from the native statx tuple."""
     (
         mode,
@@ -180,7 +212,7 @@ def _stat_from_tuple(t: tuple) -> _os.stat_result:
         blocks,
         rdev,
     ) = t
-    return _os.stat_result(
+    return os.stat_result(
         (
             mode,
             ino,
@@ -210,7 +242,7 @@ class ThreadBackend:
     name = 'thread'
 
     async def open(self, path: str, flags: int, mode: int) -> int:
-        return await _to_thread(_os.open, path, flags, mode)
+        return await _to_thread(os.open, path, flags, mode)
 
     async def read(self, fd: int, offset: int, length: int) -> bytes:
         return await _to_thread_fd(fd, _pread, fd, length, offset)
@@ -235,72 +267,68 @@ class ThreadBackend:
         # Vectored write where the OS supports it; otherwise join and fall
         # back to the plain write path (Windows has no writev).
         if append:
-            if hasattr(_os, 'writev'):
-                return await _to_thread_fd(fd, _os.writev, fd, bufs)
+            if hasattr(os, 'writev'):
+                return await _to_thread_fd(fd, os.writev, fd, bufs)
             return await self.write(fd, offset, b''.join(bufs), True)
-        if hasattr(_os, 'pwritev'):
-            return await _to_thread_fd(fd, _os.pwritev, fd, bufs, offset)
+        if hasattr(os, 'pwritev'):
+            return await _to_thread_fd(fd, os.pwritev, fd, bufs, offset)
         return await self.write(fd, offset, b''.join(bufs))
 
     async def fsync(self, fd: int, datasync: bool = False) -> None:
         # os.fdatasync is Linux-only; on macOS/Windows fall back to os.fsync
         # (which flushes data to disk just the same, only with full metadata).
-        fn = _fdatasync if datasync else _os.fsync
+        fn = _fdatasync if datasync else os.fsync
         await _to_thread_fd(fd, fn, fd)
 
     async def close(self, fd: int) -> None:
-        orphans = _orphans.pop(fd, None)
-        if orphans:
-            # Cancelled-but-running jobs still use this fd; let them finish
-            # before the fd number can be recycled by a new open().
-            await _asyncio.gather(*orphans, return_exceptions=True)
-        await _to_thread(_os.close, fd)
+        await _drain_orphans(fd)
+        await _to_thread(os.close, fd)
 
-    async def statx(self, path: str, follow: bool = True) -> _os.stat_result:
-        return await _to_thread(_os.stat if follow else _os.lstat, path)
+    async def statx(self, path: str, follow: bool = True) -> os.stat_result:
+        return await _to_thread(os.stat if follow else os.lstat, path)
 
     async def mkdir(self, path: str, mode: int = 0o777) -> None:
-        await _to_thread(_os.mkdir, path, mode)
+        await _to_thread(os.mkdir, path, mode)
 
     async def unlink(self, path: str, remove_dir: bool = False) -> None:
-        await _to_thread(_os.rmdir if remove_dir else _os.unlink, path)
+        await _to_thread(os.rmdir if remove_dir else os.unlink, path)
 
     async def rename(self, src: str, dst: str) -> None:
-        await _to_thread(_os.rename, src, dst)
+        await _to_thread(os.rename, src, dst)
 
     async def replace(self, src: str, dst: str) -> None:
         # os.replace overwrites an existing dst atomically on every platform
         # (os.rename does not on Windows).
-        await _to_thread(_os.replace, src, dst)
+        await _to_thread(os.replace, src, dst)
 
     async def symlink(self, target: str, linkpath: str) -> None:
-        await _to_thread(_os.symlink, target, linkpath)
+        await _to_thread(os.symlink, target, linkpath)
 
     async def link(self, src: str, dst: str) -> None:
-        await _to_thread(_os.link, src, dst)
+        await _to_thread(os.link, src, dst)
 
     async def filesize(self, fd: int) -> int:
-        return (await _to_thread(_os.fstat, fd)).st_size
+        return (await _to_thread_fd(fd, os.fstat, fd)).st_size
 
     # -- always executor-backed (no io_uring opcode in the crate) ---------
 
     async def ftruncate(self, fd: int, length: int) -> None:
-        await _to_thread_fd(fd, _os.ftruncate, fd, length)
+        await _to_thread_fd(fd, os.ftruncate, fd, length)
 
     async def chmod(self, path: str, mode: int) -> None:
-        await _to_thread(_os.chmod, path, mode)
+        await _to_thread(os.chmod, path, mode)
 
     async def readlink(self, path: str) -> str:
-        return await _to_thread(_os.readlink, path)
+        return await _to_thread(os.readlink, path)
 
     async def realpath(self, path: str) -> str:
-        return await _to_thread(_os.path.realpath, path)
+        return await _to_thread(os.path.realpath, path)
 
     async def scandir(self, path: str) -> list[str]:
-        return await _to_thread(_os.listdir, path)
+        return await _to_thread(os.listdir, path)
 
     async def utime(self, path: str, times) -> None:
-        await _to_thread(_functools.partial(_os.utime, path, times))
+        await _to_thread(functools.partial(os.utime, path, times))
 
 
 class UringBackend(ThreadBackend):
@@ -354,15 +382,9 @@ class UringBackend(ThreadBackend):
                     break
                 parts.append(data)
                 remaining -= len(data)
-        # Drain to a genuinely empty read: short reads are not EOF and the
-        # file may have grown since the fstatx.
-        pos = offset + sum(map(len, parts))
-        while True:
-            chunk = await driver.read(fd, pos, _READ_CHUNK)
-            if not chunk:
-                break  # empty read == EOF
-            parts.append(chunk)
-            pos += len(chunk)
+        await _drain_to_eof(
+            lambda p, n: driver.read(fd, p, n), offset + sum(map(len, parts)), parts
+        )
         if len(parts) == 1:
             return parts[0]
         return b''.join(parts)
@@ -391,15 +413,18 @@ class UringBackend(ThreadBackend):
                 await self._driver().ftruncate(fd, length)
                 return
             except OSError as e:
-                if e.errno not in (_errno.EINVAL, _errno.EOPNOTSUPP, _errno.ENOSYS):
+                if e.errno not in (errno.EINVAL, errno.EOPNOTSUPP, errno.ENOSYS):
                     raise
                 type(self)._ftruncate_uring = False
         await super().ftruncate(fd, length)
 
     async def close(self, fd: int) -> None:
+        # Inherited/fallback executor ops (ftruncate on old kernels, writev
+        # without pwritev, …) may have parked cancelled jobs on this fd.
+        await _drain_orphans(fd)
         await self._driver().close(fd)
 
-    async def statx(self, path: str, follow: bool = True) -> _os.stat_result:
+    async def statx(self, path: str, follow: bool = True) -> os.stat_result:
         return _stat_from_tuple(await self._driver().statx(path, follow))
 
     async def filesize(self, fd: int) -> int:
@@ -417,12 +442,10 @@ class UringBackend(ThreadBackend):
         driver = self._driver()
         # No O_CLOEXEC on the chain: direct descriptors are not real fds (they
         # cannot leak across exec) and the kernel rejects the flag with EINVAL.
-        chain = await driver.open_read(path, _os.O_RDONLY, 0o666, _READ_FIRST)
+        chain = await driver.open_read(path, os.O_RDONLY, 0o666, _READ_FIRST)
         if chain is None:
             # No fixed slot free (or kernel too old): classic three-step path.
-            fd = await self.open(
-                path, _os.O_RDONLY | getattr(_os, 'O_CLOEXEC', 0), 0o666
-            )
+            fd = await self.open(path, os.O_RDONLY | getattr(os, 'O_CLOEXEC', 0), 0o666)
             try:
                 return await self.readall(fd, 0)
             finally:
@@ -453,13 +476,9 @@ class UringBackend(ThreadBackend):
                         break
                     parts.append(data)
                     remaining -= len(data)
-            pos = sum(map(len, parts))
-            while True:
-                chunk = await driver.read_fixed(slot, pos, _READ_CHUNK)
-                if not chunk:
-                    break
-                parts.append(chunk)
-                pos += len(chunk)
+            await _drain_to_eof(
+                lambda p, n: driver.read_fixed(slot, p, n), sum(map(len, parts)), parts
+            )
             return parts[0] if len(parts) == 1 else b''.join(parts)
         finally:
             driver.close_fixed_nowait(slot)
@@ -467,16 +486,16 @@ class UringBackend(ThreadBackend):
     async def write_file(self, path: str, data: bytes) -> int:
         driver = self._driver()
         # As in read_file: no O_CLOEXEC on a direct-descriptor open (EINVAL).
-        flags = _os.O_WRONLY | _os.O_CREAT | _os.O_TRUNC
+        flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC
         chain = await driver.open_write(path, flags, 0o666, data)
         if chain is None:
-            fd = await self.open(path, flags | getattr(_os, 'O_CLOEXEC', 0), 0o666)
+            fd = await self.open(path, flags | getattr(os, 'O_CLOEXEC', 0), 0o666)
             try:
                 written = 0
                 while written < len(data):
                     n = await self.write(fd, written, data[written:])
                     if n <= 0:
-                        raise OSError(_errno.EIO, f'write returned {n}')
+                        raise OSError(errno.EIO, f'write returned {n}')
                     written += n
                 return written
             finally:
@@ -486,7 +505,7 @@ class UringBackend(ThreadBackend):
             while written < len(data):
                 n = await driver.write_fixed(slot, written, data[written:])
                 if n <= 0:
-                    raise OSError(_errno.EIO, f'write returned {n}')
+                    raise OSError(errno.EIO, f'write returned {n}')
                 written += n
             return written
         finally:
@@ -517,7 +536,7 @@ class IocpBackend(ThreadBackend):
     name = 'iocp'
 
     def _driver(self):
-        loop = _asyncio.get_running_loop()
+        loop = asyncio.get_running_loop()
         from . import _uring as native
 
         # On a ProactorEventLoop (asyncio's Windows default) reap completions on
@@ -532,10 +551,10 @@ class IocpBackend(ThreadBackend):
         return get_iocp_driver(loop)
 
     async def open(self, path: str, flags: int, mode: int) -> int:
-        write = bool(flags & (_os.O_WRONLY | _os.O_RDWR))
-        create = bool(flags & _os.O_CREAT)
-        truncate = bool(flags & _os.O_TRUNC)
-        exclusive = bool(flags & _os.O_EXCL)
+        write = bool(flags & (os.O_WRONLY | os.O_RDWR))
+        create = bool(flags & os.O_CREAT)
+        truncate = bool(flags & os.O_TRUNC)
+        exclusive = bool(flags & os.O_EXCL)
         return await self._driver().open(path, write, create, truncate, exclusive)
 
     async def read(self, fd: int, offset: int, length: int) -> bytes:
@@ -566,7 +585,7 @@ class IocpBackend(ThreadBackend):
         # The HANDLE isn't a C fd, so flush it with FlushFileBuffers via ctypes.
         import ctypes
 
-        await _to_thread(ctypes.windll.kernel32.FlushFileBuffers, fd)
+        await _to_thread_fd(fd, ctypes.windll.kernel32.FlushFileBuffers, fd)
 
     async def filesize(self, fd: int) -> int:
         import ctypes
@@ -576,7 +595,7 @@ class IocpBackend(ThreadBackend):
             ctypes.windll.kernel32.GetFileSizeEx(handle, ctypes.byref(n))
             return n.value
 
-        return await _to_thread(_size, fd)
+        return await _to_thread_fd(fd, _size, fd)
 
     async def ftruncate(self, fd: int, length: int) -> None:
         # fd is a Windows HANDLE; set the pointer and SetEndOfFile via ctypes
@@ -589,17 +608,20 @@ class IocpBackend(ThreadBackend):
             )
             ctypes.windll.kernel32.SetEndOfFile(handle)
 
-        await _to_thread(_trunc, fd)
+        await _to_thread_fd(fd, _trunc, fd)
 
     async def close(self, fd: int) -> None:
+        # As in UringBackend.close: inherited executor ops may have parked
+        # cancelled jobs on this fd — wait them out before the handle closes.
+        await _drain_orphans(fd)
         await self._driver().close(fd)
 
 
 def _iocp_ok() -> bool:
     """Whether the opt-in Windows IOCP backend can be used here."""
-    if _sys.platform != 'win32':
+    if sys.platform != 'win32':
         return False
-    if _os.environ.get('URIO_WINDOWS_IOCP', '') not in ('1', 'true', 'yes'):
+    if os.environ.get('URIO_WINDOWS_IOCP', '') not in ('1', 'true', 'yes'):
         return False
     try:
         from . import _uring as native
@@ -643,7 +665,7 @@ def get_backend() -> ThreadBackend:
     global _backend
     if _backend is not None:
         return _backend
-    choice = _override or _os.environ.get('URIO_BACKEND', 'auto')
+    choice = _override or os.environ.get('URIO_BACKEND', 'auto')
     if choice == 'thread':
         _backend = ThreadBackend()
     elif choice == 'uring':

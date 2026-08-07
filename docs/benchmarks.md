@@ -1,8 +1,8 @@
 # Benchmarks
 
 urio ships a benchmark comparing both backends against
-[aiofiles](https://github.com/Tinche/aiofiles) across file sizes, in **both
-binary and text mode**:
+[aiofiles](https://github.com/Tinche/aiofiles) across file sizes, in both
+binary and text mode:
 
 ```bash
 python benchmarks/bench_vs_aiofiles.py                  # human-readable
@@ -17,41 +17,43 @@ The charts below are rendered from a representative run by
 
 ## Fairness
 
-A microbenchmark is only as honest as its setup, so the harness goes out of its
-way to give every contender identical conditions:
+A microbenchmark is only as good as its setup, so the harness gives every
+contender identical conditions:
 
 - **Warm cache for everyone.** Before any read is timed, the whole working set
   is pulled into the page cache with a neutral synchronous reader, and each
-  contender additionally gets untimed warm-up runs. Nobody is measured cold
-  while another is measured warm.
-- **Per-contender isolation.** Each contender writes to its **own** set of
-  files, so it never inherits another contender's dirty pages or writeback
-  pressure — the order in which contenders run cannot advantage any of them.
-- **Median, not minimum.** Times are the **median** of N timed runs, with the
-  **[min–max] range** shown so run-to-run variance is visible rather than hidden
-  by a single luckiest minimum. Every raw sample is retained (`--json`), so
+  contender additionally gets untimed warm-up runs. No contender is measured
+  cold while another is measured warm.
+- **Per-contender isolation.** Each contender writes to its own set of files,
+  so it never inherits another contender's dirty pages or writeback pressure;
+  the order in which contenders run cannot advantage any of them.
+- **Median, not minimum.** Times are the median of N timed runs, with the
+  [min–max] range shown so run-to-run variance is visible rather than hidden
+  by a single fastest run. Every raw sample is retained (`--json`), so
   mean/best/percentiles can be derived later without re-running.
 - **Binary and text.** Every scenario runs twice: once in binary mode (the raw
-  positional path) and once in text mode (the codec + newline-translation path).
+  positional path) and once in text mode (the codec and newline-translation
+  path).
 - **Buffered and durable writes.** Each write scenario is measured twice: a
   plain buffered `write` (lands in the page cache) and a `write+fsync` that
   forces the data to disk through each library's natural path — urio via its
   async `fsync()` (io_uring `IORING_OP_FSYNC` on the uring backend, `os.fsync`
-  in the executor on the thread backend), aiofiles by flushing and `os.fsync`'ing
-  its fd. Durable writes are far more reproducible because the device, not the
-  cache, sets the pace.
-- **Concurrent.** Each scenario opens/operates/closes many files at once — the
-  regime where not parking a thread per operation can matter.
+  in the executor on the thread backend), aiofiles by flushing and calling
+  `os.fsync` on its descriptor. Durable writes are considerably more
+  reproducible because the device, not the cache, sets the pace.
+- **Concurrent.** Each scenario opens, operates on, and closes many files at
+  once — the regime where not occupying a thread per operation matters.
 
 !!! warning "These numbers are noisy and machine-specific"
     The figures below are a single run on a shared Linux development machine.
-    Buffered writes in particular swing a lot run to run because they become
-    bound by kernel writeback. Treat the **shape** of the results as the
-    takeaway, not the exact multipliers — and run it on your own hardware.
+    Buffered writes in particular vary considerably between runs because they
+    become bound by kernel writeback. Treat the shape of the results as the
+    takeaway rather than the exact multipliers, and run the benchmark on your
+    own hardware.
 
 !!! note "Test hardware"
-    Unless a chart says otherwise, all Linux numbers on this page were measured on
-    one box:
+    Unless a chart says otherwise, all Linux numbers on this page were measured
+    on one machine:
 
     | | |
     |---|---|
@@ -62,123 +64,129 @@ way to give every contender identical conditions:
     | **Python** | CPython 3.14.6 (GIL); 3.14.6t and 3.15.0b3t (free-threaded) |
 
     The spinning disk matters for the [cold-cache](#cold-cache-cold) reading:
-    with 32 GB of RAM and small working sets, even `--cold` reads are served from
-    the page cache, not the platter. Windows IOCP numbers are from a separate
-    Windows 10/11 8-core box; the free-threading ZFS comparison and the ARM/macOS
-    rows name their own hardware inline.
+    with 32 GB of RAM and small working sets, even `--cold` reads are served
+    from the page cache, not the platter. Windows IOCP numbers are from a
+    separate Windows 10/11 8-core machine; the ZFS comparison and the
+    ARM/macOS rows name their own hardware inline.
 
 ## Results
 
-Median of 7 timed runs (after warm-up) on the Linux box above (see **Test
-hardware**), CPython **3.14.6**. Every bar is one `operation × mode × size`, coloured by file
-size; a bar past the 1.0× line means urio[uring] is faster than aiofiles
-(`aiofiles ÷ urio[uring]`), short of it means slower. `urio[thread]` tracks
-aiofiles closely throughout, so the chart focuses on the io_uring backend.
+Median of 5 timed runs (after warm-up) on the Linux machine above (see **Test
+hardware**), CPython **3.14.6**. Every bar is one `operation × mode × size`,
+coloured by file size; a bar past the 1.0× line means urio[uring] is faster
+than aiofiles (`aiofiles ÷ urio[uring]`), short of it means slower.
+`urio[thread]` tracks aiofiles closely throughout, so the chart focuses on the
+io_uring backend.
 
 ![Linux io_uring speedup vs aiofiles](assets/bench-linux.svg)
 
-- **Buffered writes** win at every size up to large — submission batching for
-  small/medium files (one `io_uring_enter` per loop tick instead of one syscall
-  per op) for **3.4–5.2×** at 4–64 KB, and zero-copy submission for large binary
-  ones (**1.7× at 1 MB, parity at 8 MB**; the caller's Python `bytes` is handed
-  to the kernel with no per-write `memcpy`). Large *text* writes still trail
-  (**0.6–0.7×**) but the gap roughly halved in 0.2.0: multi-megabyte encodes
-  now run in the executor instead of stalling the event loop mid-batch.
-- **Durable writes** (`write + fsync`) converge on disk bandwidth — small/medium
-  files still win big on batched `fsync` (**4.1–5.9×**), large binary stays
-  ahead (**1.0–1.9×**), large text dips below it (**0.6–0.8×**).
-- **Warm reads** win small/medium (**2.6–3.4×**, where aiofiles' pool starves
-  under concurrency): reads are **zero-copy** (the kernel fills the returned
-  `bytes` directly, no second `memcpy`) and big reads are punted to io-wq
-  workers so their page-cache copies run on multiple cores. Large *binary*
-  still trails under the GIL (**0.8× at 1 MB, 0.5× at 8 MB** — one loop thread
-  against a pool copying on N cores; without the GIL the 8 MB read flips to a
-  **1.2× win**, see free-threading below) while large *text* wins outright
-  (**1.7–2.0×**).
-- **Streaming** a 128 MB file in 1 MB chunks runs well past the pool:
-  binary **6255 MB/s vs aiofiles's 3108 (2.0×)**, text 1860 vs 1738 (**1.1×**) —
-  the zero-copy read path turned what used to be a bandwidth-bound wash into a
-  clear win.
+- **Buffered writes** are faster at every size up to large: submission
+  batching for small and medium files (one `io_uring_enter` per loop tick
+  instead of one system call per operation) gives 3.4–5.2× at 4–64 KB, and
+  zero-copy submission serves large binary files (1.7× at 1 MB, parity at
+  8 MB; the caller's Python `bytes` is handed to the kernel with no per-write
+  `memcpy`). Large text writes remain slower (0.6–0.7×); the gap roughly
+  halved in 0.2.0, when multi-megabyte encodes moved to the executor instead
+  of stalling the event loop mid-batch.
+- **Durable writes** (`write + fsync`) converge on disk bandwidth. Small and
+  medium files still gain from batched `fsync` (4.1–5.9×), large binary stays
+  ahead (1.0–1.9×), large text falls below parity (0.6–0.8×).
+- **Warm reads** are faster at small and medium sizes (2.6–3.4×, where the
+  aiofiles pool saturates under concurrency): reads are zero-copy (the kernel
+  fills the returned `bytes` directly, with no second `memcpy`) and large
+  reads are handed to io-wq workers so their page-cache copies run on
+  multiple cores. Large binary reads remain slower under the GIL (0.8× at
+  1 MB, 0.5× at 8 MB — one loop thread against a pool copying on N cores;
+  without the GIL the 8 MB read becomes a 1.22× advantage, see free-threading
+  below), while large text reads are faster outright (1.7–2.0×).
+- **Streaming** a 128 MB file in 1 MB chunks runs well past the pool: binary
+  6255 MB/s against aiofiles's 3108 (2.0×), text 1860 against 1738 (1.1×).
+  The zero-copy read path turned what used to be a bandwidth-bound wash into
+  a consistent advantage.
 
 ## Cold cache (`--cold`)
 
-The reads above hit a warm page cache — the *worst* case for io_uring, since a
-warm read is a pure `memcpy` a thread pool can spread across cores. The `--cold`
-flag evicts each file (`fsync` + `posix_fadvise(DONTNEED)`) before every timed
-read, so reads hit storage — io_uring's intended domain.
+The reads above hit a warm page cache — the least favourable case for
+io_uring, since a warm read is a `memcpy` that a thread pool can spread
+across cores. The `--cold` flag evicts each file (`fsync` +
+`posix_fadvise(DONTNEED)`) before every timed read, so reads go to storage,
+io_uring's intended domain.
 
-**Honest result: cold-cache reads land at essentially the same shape as warm —
-small/medium win, large binary trails** (binary 4 KB **3.4×**, 64 KB **2.6×**,
-1 MB **0.77×**, 8 MB **0.45×**; the 128 MB cold stream runs **2.7×**). Two
-reasons, both worth knowing:
+Cold-cache reads land at essentially the same shape as warm: small and
+medium sizes faster, large binary slower (binary 4 KB 3.4×, 64 KB 2.6×, 1 MB
+0.77×, 8 MB 0.45×; the 128 MB cold stream runs 2.7×). There are two reasons:
 
 1. **The reads never actually reach the platter.** `/data` is a spinning HDD,
-   but the box has 32 GB of RAM and the working sets are small, so even after
-   `fadvise(DONTNEED)` the "evicted" data comes straight back from the page cache
-   — the 128 MB cold stream still runs at multi-GB/s, i.e. from RAM, not a disk
-   that tops out near ~150 MB/s. So there is no read *latency* for io_uring to
-   hide (it hides latency, not bandwidth). io_uring's real win needs genuinely
-   latency-bound storage — a loaded disk, network filesystem, or high queue depth
-   that actually misses cache — which this small-working-set setup never induces.
-2. **At these sizes reads are dominated by per-op and copy cost, not I/O wait.**
-   So cache state barely moves them, and the warm shape carries straight over:
-   small/medium win (per-op batching), large binary trails (many concurrent
-   copies saturate memory bandwidth wherever they run).
+   but the machine has 32 GB of RAM and the working sets are small, so even
+   after `fadvise(DONTNEED)` the "evicted" data comes back from the page
+   cache — the 128 MB cold stream still runs at multiple GB/s, i.e. from RAM,
+   not from a disk that tops out near 150 MB/s. There is therefore no read
+   latency for io_uring to hide (it hides latency, not bandwidth). io_uring's
+   strongest case needs genuinely latency-bound storage — a loaded disk, a
+   network filesystem, or a queue depth that actually misses cache — which
+   this small-working-set setup never induces.
+2. **At these sizes reads are dominated by per-operation and copy cost, not
+   I/O wait**, so cache state barely moves them and the warm shape carries
+   over: small and medium sizes gain from batching, large binary loses to
+   memory-bandwidth-bound copies wherever they run.
 
-So cold testing did not flip the read story on this hardware; it confirmed
-*where* the real costs are. The durable-write and high-concurrency write wins
-(below) remain the dependable advantages.
+Cold testing therefore did not change the read results on this hardware; it
+confirmed where the costs are. The durable-write and high-concurrency write
+advantages remain the dependable ones.
 
 ## Filesystem impact: ext4 vs ZFS
 
-The numbers above are ext4 on a SATA HDD. Running the **same urio build** (GIL,
-CPython 3.14.6, warm, median of 7) on a second Linux box backed by **ZFS** shows
-one operation change character completely: **durable writes**.
+The numbers above are ext4 on a SATA HDD. Running the same urio build (GIL,
+CPython 3.14.6, warm, median of 7) on a second Linux machine backed by **ZFS**
+shows one operation change character completely: durable writes.
 
 ![ZFS durable-write tax](assets/bench-zfs.svg)
 
-On ZFS every `fsync` forces a ZIL + transaction-group commit, so `write+fsync`
-latency explodes with size — `urio[uring]` 64 KB **17 → 416 ms**, 1 MB **16 →
-656 ms**, 8 MB **24 → 1695 ms** (24–71× slower than ext4). Three things make this
-honest rather than alarming:
+On ZFS every `fsync` forces a ZIL and transaction-group commit, so
+`write+fsync` latency grows steeply with size: `urio[uring]` 64 KB 17 →
+416 ms, 1 MB 16 → 656 ms, 8 MB 24 → 1695 ms (24–71× slower than ext4). Three
+points put this in context:
 
-- **It is the filesystem's cost, not urio's.** aiofiles pays the *identical* ZIL
-  tax on the same box, so urio's **speedup vs aiofiles stays ~1.0×** on the large
-  durable writes — the bar chart above is absolute milliseconds precisely because
-  the speedup ratio hides the effect. And **many-small-file durability still wins
-  big** (4 KB `write+fsync` **2.4×**, 378 vs 902 ms): aiofiles issues thousands of
-  individual `fsync`s while urio batches them into one `IORING_OP_FSYNC` sweep, a
-  gap ZFS's per-commit cost actually *widens*.
-- **Durable writes are the systematic change.** Small/medium reads still win big
-  (4 KB **3.3×**, 64 KB **4.3×**); ZFS's ARC even *absorbs* 1 MB buffered writes
-  (**17 → 12 ms**), though buffered writes overall are noisier here under txg
-  pressure.
-- **This is a ZFS data point, not a clean A/B.** The ZFS box is also a different
-  CPU (8-thread Xeon vs 4-core i5), RAM, and kernel — and a live Proxmox host —
-  so treat it as "here is how urio behaves on ZFS," not an isolated filesystem
-  benchmark.
+- **It is the filesystem's cost, not urio's.** aiofiles pays the identical
+  ZIL cost on the same machine, so urio's speedup over aiofiles stays near
+  1.0× on the large durable writes — the chart shows absolute milliseconds
+  precisely because the speedup ratio hides the effect. Many-small-file
+  durability still favours urio (4 KB `write+fsync` 2.4×, 378 vs 902 ms):
+  aiofiles issues thousands of individual `fsync` calls while urio batches
+  them into one `IORING_OP_FSYNC` sweep, a gap that ZFS's per-commit cost
+  widens.
+- **Durable writes are the systematic change.** Small and medium reads remain
+  well ahead (4 KB 3.3×, 64 KB 4.3×), and ZFS's ARC even absorbs 1 MB
+  buffered writes (17 → 12 ms), though buffered writes overall are noisier
+  under transaction-group pressure.
+- **This is a ZFS data point, not a controlled A/B.** The ZFS machine also
+  differs in CPU (8-thread Xeon vs 4-core i5), RAM, and kernel, and is a live
+  Proxmox host — read it as how urio behaves on ZFS, not as an isolated
+  filesystem benchmark.
 
-The practical rule: on a copy-on-write filesystem like ZFS, `fsync`-heavy
-workloads are bound by the commit, not the async library — reach for urio's
-batched `fsync` when you have **many** files to make durable, and expect large
-single-file durable writes to converge with everything else on the device.
+The practical rule: on a copy-on-write filesystem such as ZFS, `fsync`-heavy
+workloads are bound by the commit, not the async library. urio's batched
+`fsync` helps when many files must be made durable; large single-file durable
+writes converge with everything else on the device.
 
 ## Windows (IOCP backend)
 
-The Windows [IOCP backend](getting-started/backends.md) is production-validated on
+The Windows [IOCP backend](getting-started/backends.md) is validated on
 Windows 10/11 (CPython **3.14**, GIL and free-threaded): the full test suite
-(190 tests, including the differential suite against the stdlib `io` oracles)
-and a concurrency + cancellation + error-path stress test both pass. Getting there fixed three cross-platform Windows correctness bugs — every
-fd is now opened `O_BINARY` (without it the CRT runs in text mode and
-`os.read`/`os.write` translate CRLF, corrupting binary data and desyncing
-offsets), `Path.replace()` overwrites via `os.replace` (`os.rename` fails on
-Windows if the target exists), and IOCP exclusive-create uses `CREATE_NEW`
-(`O_EXCL` / `'x'` mode now raises `FileExistsError`).
+(190 tests at the time of validation, including the differential suite
+against the stdlib `io` oracles) and a concurrency + cancellation +
+error-path stress test pass. Getting there fixed three cross-platform Windows
+correctness bugs: every descriptor is now opened `O_BINARY` (without it the
+CRT runs in text mode and `os.read`/`os.write` translate CRLF, corrupting
+binary data and desynchronising offsets), `Path.replace()` overwrites via
+`os.replace` (`os.rename` fails on Windows if the target exists), and IOCP
+exclusive-create uses `CREATE_NEW` (`O_EXCL` / `'x'` mode raises
+`FileExistsError`).
 
 ![Windows IOCP speedup vs aiofiles](assets/bench-windows.svg)
 
-Measured against aiofiles (**median of 5**, warm cache, concurrent, CPython 3.14),
-as a speedup (`aiofiles ÷ urio[iocp]`, >1 means urio is faster):
+Measured against aiofiles (median of 5, warm cache, concurrent, CPython
+3.14), as a speedup (`aiofiles ÷ urio[iocp]`, above 1 means urio is faster):
 
 | Workload | buffered write | write+fsync | read |
 |---|--:|--:|--:|
@@ -187,50 +195,52 @@ as a speedup (`aiofiles ÷ urio[iocp]`, >1 means urio is faster):
 | text, small/med (4–64 KB) | 0.97–1.32× | 1.14–1.36× | 0.54–0.85× |
 | text, large (1–8 MB) | 1.53–1.89× | 1.42–1.71× | **1.34–1.74×** |
 
-So urio[iocp] is **at parity-to-winning on buffered writes** (zero-copy writes,
-the same technique as the io_uring backend; only large *binary* buffered writes
-soften), **wins on durable writes** except large binary (~0.9×), and — with
-reads now **zero-copy** too (the kernel fills the returned `bytes` directly) —
-**wins large text outright** (1.3–1.9× across write/fsync/read; streaming a
-128 MB binary file runs 2.1 GB/s vs aiofiles' 1.5). The loss that remains is
-**binary reads** (0.25–0.61×).
+urio[iocp] is at parity or faster on buffered writes (zero-copy writes, the
+same technique as the io_uring backend; only large binary buffered writes
+fall behind), faster on durable writes except large binary (about 0.9×), and
+— with reads zero-copy as well (the kernel fills the returned `bytes`
+directly) — faster on large text across write, fsync, and read (1.3–1.9×;
+streaming a 128 MB binary file runs 2.1 GB/s against aiofiles' 1.5). The
+remaining loss is binary reads (0.25–0.61×).
 
 The binary-read loss is structural on Windows: a warm-cache overlapped
-`ReadFile` completes *synchronously*, so the kernel performs the copy inline on
-the submitting loop thread — one core — while aiofiles' pool runs N copies in
-parallel. Zero-copy reads removed the second (Python-side) copy, which is why
-streaming and text flipped to wins, but the inline kernel copy remains
-single-threaded. A single 8 MB file reads at parity with aiofiles; the gap opens
-under concurrency.
+`ReadFile` completes *synchronously*, so the kernel performs the copy inline
+on the submitting loop thread — one core — while the aiofiles pool runs N
+copies in parallel. Zero-copy reads removed the second (Python-side) copy,
+which is why streaming and text moved ahead, but the inline kernel copy
+remains single-threaded. A single 8 MB file reads at parity with aiofiles;
+the gap opens under concurrency.
 
-**How completions are reaped (the key design).** urio reaps completions **on the
-event-loop thread**, the Windows analogue of the Linux eventfd design — no poller
-thread, no `call_soon_threadsafe`. asyncio's `ProactorEventLoop` already owns an
-I/O completion port and blocks on it; urio opens files with overlapped I/O,
-associates them with *that* port, and submits reads/writes (with offsets, which
-the stock `_overlapped` module cannot express) through a small native object that
-registers each op with the proactor. When the kernel posts a completion the loop
-wakes itself and resolves the future inline — a per-op round-trip floor of
-**~41 µs**. On non-`ProactorEventLoop` loops (e.g. `SelectorEventLoop`) urio
-falls back to a single poller thread that reaps completions in batches
+**How completions are reaped.** urio reaps completions on the event-loop
+thread, the Windows analogue of the Linux eventfd design; there is no poller
+thread and no `call_soon_threadsafe`. asyncio's `ProactorEventLoop` already
+owns an I/O completion port and blocks on it; urio opens files with
+overlapped I/O, associates them with that port, and submits reads and writes
+(with offsets, which the stock `_overlapped` module cannot express) through a
+small native object that registers each operation with the proactor. When
+the kernel posts a completion the loop wakes and resolves the future inline,
+with a per-operation round-trip floor of about 41 µs. On
+non-`ProactorEventLoop` loops (such as `SelectorEventLoop`) urio falls back
+to a single poller thread that reaps completions in batches
 (`GetQueuedCompletionStatusEx`) and delivers each batch with one
 `call_soon_threadsafe`.
 
-Concurrent binary reads are the weakest case (down to ~0.25× at 8 MB) for that
-inline-copy reason; writes and durable writes are competitive and large text now
-wins. The backend stays opt-in (`URIO_WINDOWS_IOCP=1`) and Windows defaults to
-the thread pool — binary reads are the deciding factor, and the thread pool
-spreads the read copy across cores.
+Concurrent binary reads are the weakest case (down to about 0.25× at 8 MB)
+for the inline-copy reason above; writes and durable writes are competitive
+and large text is ahead. The backend stays opt-in (`URIO_WINDOWS_IOCP=1`) and
+Windows defaults to the thread pool: binary reads decide many workloads, and
+the thread pool spreads the read copy across cores.
 
 ## ARM / aarch64 (Jetson Nano — thread fallback)
 
-urio is validated on a **Jetson Nano** (aarch64, Ubuntu 18.04, Tegra X1 4-core).
-Its kernel is 4.9, which predates io_uring, so urio automatically falls back to
-the **thread backend** — the intended behaviour on old kernels — and the
+urio is validated on a **Jetson Nano** (aarch64, Ubuntu 18.04, Tegra X1
+4-core). Its kernel is 4.9, which predates io_uring, so urio falls back to
+the thread backend — the intended behaviour on old kernels — and the
 `manylinux2014` aarch64 wheel installs and runs on glibc 2.27.
 
 Here the comparison is `urio[thread]` vs aiofiles (best of 3, warm cache,
-concurrent), as a speedup (`aiofiles ÷ urio[thread]`, >1 means urio is faster):
+concurrent), as a speedup (`aiofiles ÷ urio[thread]`, above 1 means urio is
+faster):
 
 | Size | binary write | binary read | text write | text read |
 |---|--:|--:|--:|--:|
@@ -239,20 +249,22 @@ concurrent), as a speedup (`aiofiles ÷ urio[thread]`, >1 means urio is faster):
 | 1 MB | 0.94× | 1.04× | **1.90×** | 0.65× |
 | 8 MB | 0.77× | 0.53× | 1.04× | 0.98× |
 
-Durable (`fsync`) writes land at 0.88–1.11×. The headline is that **the thread
-backend tracks aiofiles within ~±10% on ARM**, as designed — it is the same
-thread-pool strategy — while urio's text-write coalescing still wins on large
-text writes (1.9×). The slower spots are large warm reads (executor copy on a
-slow microSD), the same `memcpy`-bound shape seen elsewhere. (On a newer-kernel
-ARM box, urio would instead use the native io_uring backend.)
+Durable (`fsync`) writes land at 0.88–1.11×. The thread backend tracks
+aiofiles within about ±10% on ARM, as designed — it is the same thread-pool
+strategy — while urio's text-write coalescing still helps on large text
+writes (1.9×). The slower spots are large warm reads (executor copy on a
+slow microSD), the same `memcpy`-bound shape seen elsewhere. On an ARM
+machine with a newer kernel, urio would use the native io_uring backend
+instead.
 
 ## 32-bit ARM io_uring (Raspberry Pi)
 
-io_uring also runs on **32-bit ARM**. On a Raspberry Pi (armv7l, kernel
-5.15, CPython 3.12) urio uses its **native io_uring backend** — validated correct
-(read/write/fsync/concurrency) and faster than aiofiles on the workloads that
-matter on a small box. Median of 3, warm, concurrent
-(`aiofiles ÷ urio[uring]`; raw samples in `benchmarks/data/linux-armv7l-*.json`):
+io_uring also runs on 32-bit ARM. On a Raspberry Pi (armv7l, kernel 5.15,
+CPython 3.12) urio uses its native io_uring backend, validated for
+correctness (read/write/fsync/concurrency) and faster than aiofiles on the
+workloads that matter on a small machine. Median of 3, warm, concurrent
+(`aiofiles ÷ urio[uring]`; raw samples in
+`benchmarks/data/linux-armv7l-*.json`):
 
 | Scenario | write | write+fsync | read |
 |---|--:|--:|--:|
@@ -262,15 +274,16 @@ matter on a small box. Median of 3, warm, concurrent
 | 150 × 64 KB text | 1.18× | 0.63× | **2.33×** |
 | 20 × 1 MB binary | 0.35× | 0.77× | 0.49× |
 
-The dependable win is **reads: 2.2–2.9×** across small/medium files — larger than
-on x86, because on a weak, RAM-starved Pi the thread pool contends hardest while
-urio's single loop thread plus io_uring sails through. Small/medium **durable
-writes** also win (up to 2.4×): one batched `IORING_OP_FSYNC` sweep versus
-aiofiles' hundreds of executor `fsync`s on a slow microSD. **Large (1 MB)** files
-flip to a loss (0.4–0.8×) — few files, no concurrency to exploit, throughput- and
-`memcpy`-bound. Buffered writes are **very noisy** on this SD card (†the 300×4 KB
-binary `0.22×` is a writeback outlier — the `fsync` rows are the reliable write
-metric). Working sets are kept small (the box has ~470 MB free).
+The dependable gain is reads, 2.2–2.9× across small and medium files —
+larger than on x86, because on a slow, memory-constrained Pi the thread pool
+contends hardest while urio's single loop thread with io_uring does not.
+Small and medium durable writes also gain (up to 2.4×): one batched
+`IORING_OP_FSYNC` sweep versus hundreds of executor `fsync` calls on a slow
+microSD. Large (1 MB) files fall behind (0.4–0.8×): few files, no concurrency
+to exploit, throughput- and `memcpy`-bound. Buffered writes are very noisy on
+this SD card (†the 300×4 KB binary 0.22× is a writeback outlier; the `fsync`
+rows are the reliable write metric). Working sets are kept small (the machine
+has about 470 MB free).
 
 Build note: the `io-uring` crate ships no 32-bit-ARM syscall bindings, so the
 armv7 wheel is built with `RUSTFLAGS=--cfg io_uring_skip_arch_check` — safe
@@ -279,26 +292,26 @@ because the io_uring ABI structs are fixed-width, and validated on this Pi.
 ## Free-threaded Python (no-GIL) changes the read story
 
 Free-threaded CPython (PEP 703, the `t` builds) removes the GIL, and that
-reshapes the warm-cache comparison. **urio runs GIL-free too** — the native
+reshapes the warm-cache comparison. urio itself runs GIL-free: the native
 module declares free-threaded support (`gil_used = false`), and each ring is
-used only by its own event loop's driver, so no native state is ever shared
-across threads. Crucially, **urio has the same thread-pool mode aiofiles
-does**: its `thread` backend runs the blocking syscalls in the loop's executor,
-so under no-GIL its warm-read copies parallelise across all cores *identically*.
-So this is not urio "losing" free-threading — you keep io_uring/IOCP for the
-write, `fsync`, and latency wins, and drop to urio's thread backend for warm
-reads, where it matches aiofiles. What the numbers below isolate is only the
-*native* backends' warm-read edge — the advantage a single loop thread held over
-a **GIL-bound** pool — narrowing as that pool is unshackled.
+used only by its own event loop's driver, so no native state is shared across
+threads. urio also has the same thread-pool mode aiofiles does: its `thread`
+backend runs the blocking system calls in the loop's executor, so under
+no-GIL its warm-read copies parallelise across all cores identically. This is
+therefore not urio losing anything to free-threading: io_uring/IOCP keep the
+write, `fsync`, and latency advantages, and the thread backend matches
+aiofiles for warm reads. The numbers below isolate only the native backends'
+warm-read margin — the advantage a single loop thread held over a GIL-bound
+pool — as that pool gains real parallelism.
 
-Measured on the **same** interpreter version, GIL vs no-GIL (CPython 3.14.6 vs
-3.14.6t, x86_64 4-core), binary **reads**, as a speedup
+Measured on the same interpreter version, GIL vs no-GIL (CPython 3.14.6 vs
+3.14.6t, x86_64 4-core), binary reads, as a speedup
 (`aiofiles ÷ urio[uring]`):
 
 The chart below pairs the Linux io_uring rows with the Windows IOCP rows
-(detailed [below](#windows-iocp-under-no-gil-reads-lose-writes-hold)) — the same
-free-threading effect shows on both backends: GIL (blue) vs no-GIL (orange),
-speedup vs aiofiles.
+(detailed [below](#windows-iocp-under-no-gil-reads-lose-writes-hold)); the
+same free-threading effect shows on both backends: GIL (blue) vs no-GIL
+(orange), speedup vs aiofiles.
 
 ![Free-threading GIL vs no-GIL — io_uring and IOCP](assets/bench-nogil.svg)
 
@@ -309,33 +322,32 @@ speedup vs aiofiles.
 | 1 MB | 0.81× | 0.97× | 29 → 17 |
 | 8 MB | 0.49× | **1.22×** | 25 → 23 |
 
-**Free-threading narrows urio[uring]'s small/medium warm-read edge — and flips
-the large-read story.** With no GIL, aiofiles and `urio[thread]` copy read data
-into Python `bytes` **in parallel across all cores**, so their small reads
-speed up sharply exactly where a GIL-bound pool was starving — aiofiles 4 KB
-285 → 179 ms, 64 KB 71 → 42 ms — and the small-read multiplier compresses
-(4 KB 3.40× → 2.24×, 64 KB 2.88× → 1.60×). Large reads are the GIL story's
-weak spot (1 MB 0.81×, 8 MB 0.49× — one loop thread against a pool); with
-**zero-copy reads** plus the io-wq punt for ≥1 MB reads, removing the GIL
-brings 1 MB to parity and turns 8 MB into a **1.22× win** — free-threaded
-CPython's costlier refcounting hurts the pool more than the ring.
-(3.15.0b3t sharpens the picture further: binary reads win at **every** size —
-4 KB 1.77×, 64 KB 1.38×, 1 MB 1.14×, 8 MB 1.31× — while small/medium `fsync`
-stays a 2.1–2.5× io_uring win.)
+Free-threading narrows urio[uring]'s small/medium warm-read margin and
+reverses the large-read one. With no GIL, aiofiles and `urio[thread]` copy
+read data into Python `bytes` in parallel across all cores, so their small
+reads speed up sharply exactly where a GIL-bound pool was starving (aiofiles
+4 KB 285 → 179 ms, 64 KB 71 → 42 ms) and the small-read multiplier
+compresses (4 KB 3.40× → 2.24×, 64 KB 2.88× → 1.60×). Large reads are the
+GIL configuration's weak spot (1 MB 0.81×, 8 MB 0.49× — one loop thread
+against a pool); with zero-copy reads and the io-wq punt for reads of 1 MB
+and up, removing the GIL brings 1 MB to parity and makes 8 MB 1.22× faster —
+free-threaded CPython's costlier reference counting affects the pool more
+than the ring. (3.15.0b3t sharpens the picture: binary reads are faster at
+every size — 4 KB 1.77×, 64 KB 1.38×, 1 MB 1.14×, 8 MB 1.31× — while small
+and medium `fsync` stays a 2.1–2.5× io_uring advantage.)
 
-Writes are unaffected: urio's **submission batching still wins** on small/medium
-buffered writes under no-GIL (~1.1–2.2×), because that path is syscall-bound, not
-copy-bound. And urio's *own* thread backend speeds up **exactly like aiofiles**
-(same executor strategy) — so the practical rule on free-threaded Python is
-**reads favour the thread pool, writes favour io_uring**, and urio gives you
-both: drop to its thread backend for warm reads (parity with aiofiles), keep
-io_uring for writes.
+Writes are unaffected: submission batching remains 1.1–2.2× faster on small
+and medium buffered writes under no-GIL, because that path is bound by system
+calls, not copies. urio's own thread backend speeds up exactly like aiofiles
+(same executor strategy). The practical rule on free-threaded Python is that
+reads favour the thread pool and writes favour io_uring, and urio provides
+both: use the thread backend for warm reads (parity with aiofiles), io_uring
+for writes.
 
-**Takeaway:** urio is free-threaded-ready and, like aiofiles, drops to a
+In short: urio is free-threading-ready and, like aiofiles, gains a
 parallelised thread pool for warm reads. Free-threading narrows only the
-*native* backends' warm-cache *read* edge (the weakest, `memcpy`-bound case); the
-durable advantages remain **write batching** and **latency-bound / cold I/O** —
-and for warm reads you simply use the thread backend, losing nothing to aiofiles.
+native backends' warm-cache read margin (the `memcpy`-bound case); the
+durable advantages remain write batching and latency-bound or cold I/O.
 
 !!! note "Python version support"
     Validated free-threaded on **3.14t and 3.15.0b3t**. **PyO3 0.29** (urio's
@@ -345,15 +357,16 @@ and for warm reads you simply use the thread backend, losing nothing to aiofiles
 
 ### Windows IOCP under no-GIL — reads lose, writes hold
 
-The IOCP backend reaps and copies each read on the single event-loop thread (the
-ProactorEventLoop design above), while aiofiles' pool — and urio's own thread
-backend — fan the copy across cores. So IOCP's characteristic weakness is
-**reads**, and free-threading deepens it. These are the `IOCP ·` rows in the
+The IOCP backend reaps and copies each read on the single event-loop thread
+(the ProactorEventLoop design above), while the aiofiles pool — and urio's
+own thread backend — spread the copy across cores. IOCP's characteristic
+weakness is therefore reads, and free-threading deepens it. These are the
+`IOCP ·` rows in the
 [free-threading chart above](#free-threaded-python-no-gil-changes-the-read-story).
 
-Median of 5 on Windows 10 (8-core), CPython **3.14 (GIL) vs 3.14t (no-GIL)**, same
-zero-copy IOCP build, against aiofiles (`aiofiles ÷ urio[iocp]`, >1 means urio is
-faster):
+Median of 5 on Windows 10 (8-core), CPython **3.14 (GIL) vs 3.14t (no-GIL)**,
+same zero-copy IOCP build, against aiofiles (`aiofiles ÷ urio[iocp]`, above 1
+means urio is faster):
 
 | Size | Op | GIL | no-GIL |
 |---|---|--:|--:|
@@ -364,86 +377,90 @@ faster):
 | 1 MB | read (text) | 1.74× | 0.75× |
 | 8 MB | read (text) | 1.34× | 0.69× |
 
-**IOCP wins on durable writes and loses on binary reads — and free-threading's
-clearest effect is on _text_ reads.** Binary reads lose in both GIL states
-(0.47× → 0.64×, 0.25× → 0.33× — the warm `ReadFile` copy completes inline on
-the loop thread). But large text reads, which **win under the GIL** (1.34–1.74×
-since zero-copy reads landed), drop to **~0.7× without it** — free-threading
-lets aiofiles' pool *and* urio's own thread backend run the decode + copy across
-all cores, while IOCP's reap stays on the loop thread. Durable small writes hold
-(1.11× → 1.13×). The binary-read loss is inherent to the loop-thread design,
-which is why IOCP remains opt-in.
+IOCP is ahead on durable writes and behind on binary reads, and
+free-threading's clearest effect is on text reads. Binary reads are behind in
+both GIL states (0.47× → 0.64×, 0.25× → 0.33×; the warm `ReadFile` copy
+completes inline on the loop thread). Large text reads, ahead under the GIL
+(1.34–1.74× since zero-copy reads), drop to about 0.7× without it:
+free-threading lets the aiofiles pool and urio's own thread backend run the
+decode and copy across all cores, while IOCP's reap stays on the loop
+thread. Durable small writes hold (1.11× → 1.13×). The binary-read loss is
+inherent to the loop-thread design, which is why IOCP remains opt-in.
 
-**The thread backend, by contrast, tracks aiofiles everywhere.** Two design
-choices make it hold up under free-threading. Writes go through an unbuffered
-`io.FileIO` rather than `os.write` (which on Windows is ~7× slower for large
-buffers), keeping binary writes at parity. And the text codec (encode/decode +
-newline translation), which otherwise runs on the single loop thread, is
-**offloaded to the executor for payloads ≥32 KiB on free-threaded interpreters**
-(inline under the GIL, where the hop would only add latency) — so concurrent
-files' codecs parallelise across cores. The thread backend's no-GIL reads then
-track aiofiles: 1 MB text read **0.92×**, 8 MB text read **0.98×**, 8 MB binary
-read **0.88×**, 1 MB binary read **1.09×**; text and binary writes are ~parity
-(8 MB binary write **0.93×**, text writes 0.97–1.01×).
+The thread backend, by contrast, tracks aiofiles everywhere. Two design
+choices keep it level under free-threading. Writes go through an unbuffered
+`io.FileIO` rather than `os.write` (which on Windows is about 7× slower for
+large buffers), keeping binary writes at parity. And the text codec
+(encode/decode and newline translation), which otherwise runs on the single
+loop thread, is offloaded to the executor for payloads of 32 KiB and up on
+free-threaded interpreters (inline under the GIL, where the hop would only
+add latency), so concurrent files' codecs parallelise across cores. The
+thread backend's no-GIL reads then track aiofiles: 1 MB text read 0.92×,
+8 MB text read 0.98×, 8 MB binary read 0.88×, 1 MB binary read 1.09×; text
+and binary writes are near parity (8 MB binary write 0.93×, text writes
+0.97–1.01×).
 
-**Practical rule on free-threaded Windows: prefer urio's thread backend for
-read-heavy work.** The thread backend is at parity with aiofiles for both
+The practical rule on free-threaded Windows: prefer urio's thread backend
+for read-heavy work. The thread backend is at parity with aiofiles for both
 binary and text; IOCP's loop-thread reaping is an asset under the GIL (no
-cross-thread hop, and it keeps its durable-write edge — 1.13× — even without
-the GIL) and a liability for copy/codec-bound reads without it. This mirrors
-the Linux result — free-threading favours the thread pool for copy/codec-bound
-work. IOCP stays opt-in; the thread pool remains the Windows default.
+cross-thread hop, and it keeps its durable-write margin — 1.13× — even
+without the GIL) and a liability for copy- or codec-bound reads without it.
+This mirrors the Linux result: free-threading favours the thread pool for
+copy- and codec-bound work. IOCP stays opt-in; the thread pool remains the
+Windows default.
 
 ## Durable writes converge on the device
 
-For `write+fsync`, urio and aiofiles land in the same band — `fsync` makes the
-storage device the bottleneck, so the async library stops mattering. urio is
-competitive throughout and faster on some sizes; differences sit within
-run-to-run noise on a shared machine. Reproduce on your own hardware:
+For `write+fsync`, urio and aiofiles land in the same band: `fsync` makes
+the storage device the bottleneck, so the async library stops mattering.
+urio is competitive throughout and faster at some sizes; differences sit
+within run-to-run noise on a shared machine. To reproduce:
 
 ```bash
 python benchmarks/bench_vs_aiofiles.py --repeat 9 --warmup 2
 ```
 
-## A few mechanics behind the numbers
+## Mechanics behind the numbers
 
-**Why writes win.** Every queued operation reaches the kernel in a single
-`io_uring_enter` per event-loop tick instead of one syscall per op — a
-500-write workload issues ~15 enters, not 1500 — and large writes point the
-kernel at the caller's Python `bytes` directly, with no per-write `memcpy`.
-Large *text* writes trail because they re-encode before submitting.
+**Why writes are faster.** Every queued operation reaches the kernel in a
+single `io_uring_enter` per event-loop tick instead of one system call per
+operation — a 500-write workload issues about 15 enters, not 1500 — and
+large writes point the kernel at the caller's Python `bytes` directly, with
+no per-write `memcpy`. Large text writes trail because they re-encode before
+submitting.
 
-**Why reads hold up.** The kernel writes into an uninitialised Python `bytes`
-that is handed back as-is (no `memset`, no second copy — only the bytes
-actually read are ever exposed), and reads of 1 MB and up are punted to io-wq
-workers so concurrent warm-cache copies run on multiple cores. That is what
-moved large binary reads from 0.3–0.5× to parity-ish and flipped streaming to
-a win.
+**Why reads hold up.** The kernel writes into an uninitialised Python
+`bytes` that is handed back as-is (no `memset`, no second copy; only the
+bytes actually read are ever exposed), and reads of 1 MB and up are handed
+to io-wq workers so concurrent warm-cache copies run on multiple cores. That
+moved large binary reads from 0.3–0.5× to near parity and made streaming
+faster.
 
 **`writelines` is one submission.** The whole batch goes to the ring as a
-single vectored `writev`, so it pays one round-trip instead of one per line —
+single vectored `writev`, so it pays one round-trip instead of one per line;
 the saving scales with the number of lines.
 
 **Sized text `read(n)` is one round-trip.** It requests the whole remaining
-deficit from the raw layer in one go (matching the binary path); what remains
-is the incremental Python decode. Line-oriented text iteration refills a
-128 KB chunk per round-trip and decodes incrementally, so streaming a large
-text file line by line trails a C `TextIOWrapper` — read binary and
-bulk-decode if text line-streaming throughput is critical.
+deficit from the raw layer in one call (matching the binary path); what
+remains is the incremental Python decode. Line-oriented text iteration
+refills a 128 KB chunk per round-trip and decodes incrementally, so
+streaming a large text file line by line trails a C `TextIOWrapper`; read
+binary and bulk-decode if text line-streaming throughput is critical.
 
-**The thread backend tracks aiofiles — reads and writes, every platform.** It
-is the same thread-pool strategy aiofiles pioneered, and it is what urio uses
-where no native backend is available or selected. Both reads and writes go
-through `io.FileIO`, the same C-level object a Python file wraps.
+**The thread backend tracks aiofiles — reads and writes, every platform.**
+It is the same thread-pool strategy aiofiles uses, and it is what urio
+selects where no native backend is available or chosen. Both reads and
+writes go through `io.FileIO`, the same C-level object a Python file wraps.
 
-## Takeaways
+## Summary
 
-- Reach for urio's io_uring backend for **high-concurrency reads and writes,
-  durable writes**, and workloads bound by **I/O latency**.
-- Since reads became zero-copy (the kernel fills the returned `bytes` directly,
-  large reads fanned out to io-wq workers), reads are **faster-to-parity across
-  the board on Linux** — the one soft spot left is many *concurrent* 8 MB warm
-  reads (~0.7×), which saturate memory bandwidth wherever they run. On Windows
-  the IOCP read copy is still loop-thread-bound, which is why IOCP stays opt-in.
-- One API, the best available backend at runtime — and a benchmark you can rerun
-  on your own hardware to see where you land.
+- Use urio's io_uring backend for high-concurrency reads and writes, durable
+  writes, and workloads bound by I/O latency.
+- With zero-copy reads (the kernel fills the returned `bytes` directly, and
+  large reads fan out to io-wq workers), reads range from faster to parity
+  on Linux; the remaining soft spot is many concurrent 8 MB warm reads under
+  the GIL (0.5–0.8×), which saturate memory bandwidth wherever they run. On
+  Windows the IOCP read copy is loop-thread-bound, which is why IOCP stays
+  opt-in.
+- One API, the best available backend at runtime, and a benchmark that can
+  be re-run on your own hardware.

@@ -16,12 +16,13 @@ wheel works across CPython versions.
 - **Windows 10/11** for the [IOCP backend](backends.md) — opt-in via
   `URIO_WINDOWS_IOCP=1`; Windows otherwise uses the thread backend.
 
-Everywhere else — macOS, older kernels, sandboxes where the io_uring syscalls
-are blocked — urio automatically uses its [thread-pool backend](backends.md),
-the same approach aiofiles takes, so the library works on any platform.
+Everywhere else (macOS, older kernels, environments where the io_uring system
+calls are blocked) urio automatically uses its
+[thread-pool backend](backends.md), the same approach aiofiles takes, so the
+library works on any platform.
 
-urio detects io_uring availability at runtime by actually creating a ring, so
-you never have to branch on platform yourself.
+urio detects io_uring availability at runtime by creating a ring, so callers
+never need to branch on platform.
 
 ## Platforms & wheels
 

@@ -7,9 +7,9 @@ from urio import Path  # alias of urio.AsyncPath
 An async counterpart to `pathlib.Path`. **Pure-path** operations (those that
 only manipulate the path string) are synchronous and delegate directly to
 `pathlib`. **Filesystem** operations are coroutines and go through the active
-[backend](backends.md) — so on Linux `stat`, `mkdir`, `unlink`, `rename`,
-`symlink_to`, `hardlink_to`, and the read/write helpers are genuine io_uring
-submissions, while directory listing and a few metadata tweaks use the
+[backend](backends.md); on Linux `stat`, `mkdir`, `unlink`, `rename`,
+`symlink_to`, `hardlink_to`, and the read/write helpers are io_uring
+submissions, while directory listing and a few metadata operations use the
 thread-pool path.
 
 This is functionality aiofiles does not offer.
@@ -102,11 +102,12 @@ Read/write the whole file in binary. `write_bytes` returns the byte count.
 Read/write the whole file as text. `write_text` returns the character count.
 
 !!! tip "One-submission fast path"
-    On the io_uring backend these four helpers ride a **linked open→I/O chain**
-    on a fixed-file table: the open and the first read/write reach the kernel as
-    a single submission, so a small file costs one round-trip instead of three
-    (see [How it works](../internals.md#linked-openreadwrite-chains)). Whole-file
-    reads are also zero-copy — the kernel fills the returned `bytes` directly.
+    On the io_uring backend these four helpers use a **linked open-then-I/O
+    chain** on a fixed-file table: the open and the first read/write reach the
+    kernel as a single submission, so a small file costs one round-trip instead
+    of three (see [How it works](../internals.md#linked-open-then-io-chains)).
+    Whole-file reads are also zero-copy: the kernel fills the returned `bytes`
+    directly.
 
 #### `open(mode='r', *, encoding=None, errors=None, newline=None)`
 Open this path and return the same awaitable/context-manager object as

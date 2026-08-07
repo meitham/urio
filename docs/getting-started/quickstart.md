@@ -68,9 +68,9 @@ async def main():
         print(child.name)
 ```
 
-## Concurrency — where urio shines
+## Concurrency
 
-Because the native backends (io_uring, IOCP) don't tie up a thread per
+Because the native backends (io_uring, IOCP) do not occupy a thread per
 operation, large fan-out workloads scale well:
 
 ```python
@@ -87,4 +87,4 @@ async def main():
     await asyncio.gather(*(save(i) for i in range(1000)))
 ```
 
-See the [benchmarks](../benchmarks.md) for what that concurrency buys.
+See the [benchmarks](../benchmarks.md) for measurements.

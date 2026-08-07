@@ -1043,6 +1043,37 @@ mod iocp {
                 PostQueuedCompletionStatus(self.port as *mut c_void, 0, 0, op as *const OVERLAPPED);
             }
         }
+
+        /// Signal the poller thread to stop and wait for it, then close the
+        /// port. The join MUST run with the GIL released: this thread usually
+        /// holds the GIL (shutdown is driven from the loop thread), while the
+        /// poller thread needs the GIL to unwind — it drops its `Py<PyAny>`
+        /// handles and may be mid `call_soon_threadsafe`. Joining while holding
+        /// the GIL therefore deadlocks (only under a real GIL — free-threaded
+        /// builds are unaffected, which is why this hid on GIL Windows alone).
+        fn stop_poller(&mut self) {
+            if self.poller.is_none() {
+                return;
+            }
+            unsafe {
+                PostQueuedCompletionStatus(
+                    self.port as *mut c_void,
+                    0,
+                    SHUTDOWN_KEY,
+                    std::ptr::null(),
+                );
+            }
+            if let Some(j) = self.poller.take() {
+                Python::attach(|py| {
+                    py.detach(|| {
+                        let _ = j.join();
+                    })
+                });
+            }
+            unsafe {
+                CloseHandle(self.port as *mut c_void);
+            }
+        }
     }
 
     #[pymethods]
@@ -1250,28 +1281,13 @@ mod iocp {
         }
 
         fn shutdown(&mut self) {
-            unsafe {
-                PostQueuedCompletionStatus(
-                    self.port as *mut c_void,
-                    0,
-                    SHUTDOWN_KEY,
-                    std::ptr::null(),
-                );
-            }
-            if let Some(j) = self.poller.take() {
-                let _ = j.join();
-            }
-            unsafe {
-                CloseHandle(self.port as *mut c_void);
-            }
+            self.stop_poller();
         }
     }
 
     impl Drop for Iocp {
         fn drop(&mut self) {
-            if self.poller.is_some() {
-                self.shutdown();
-            }
+            self.stop_poller();
         }
     }
 

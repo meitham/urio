@@ -47,10 +47,10 @@ jobs:
         if: runner.os == 'Windows'
         env:
           URIO_WINDOWS_IOCP: '1'
-        # -v to name the wedging test; faulthandler_timeout dumps every
-        # thread's stack if one hangs, instead of silently hitting the job
-        # timeout with no clue which test or where.
-        run: pytest -v -o faulthandler_timeout=90
+        # faulthandler_timeout dumps every thread's stack if a test wedges,
+        # so a hang names its culprit instead of silently hitting the job
+        # timeout.
+        run: pytest -q -o faulthandler_timeout=120
 
   test-free-threaded:
     strategy:
@@ -79,7 +79,7 @@ jobs:
         if: runner.os == 'Windows'
         env:
           URIO_WINDOWS_IOCP: '1'
-        # -v to name the wedging test; faulthandler_timeout dumps every
-        # thread's stack if one hangs, instead of silently hitting the job
-        # timeout with no clue which test or where.
-        run: pytest -v -o faulthandler_timeout=90
+        # faulthandler_timeout dumps every thread's stack if a test wedges,
+        # so a hang names its culprit instead of silently hitting the job
+        # timeout.
+        run: pytest -q -o faulthandler_timeout=120

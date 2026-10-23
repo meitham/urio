@@ -57,6 +57,17 @@ def _ring_entries() -> int:
     return min(n, 32768) if n > 0 else _DEFAULT_ENTRIES
 
 
+def _close_abandoned_open(fut: asyncio.Future) -> None:
+    try:
+        fd, _ = fut.result()
+    except BaseException:
+        return
+    try:
+        os.close(fd)
+    except OSError:
+        pass
+
+
 class _Chain:
     """Bookkeeping for one linked open→I/O pair on a fixed-file slot.
 
@@ -109,6 +120,9 @@ class Driver:
         # Completions to swallow without slot/future accounting (fire-and-forget
         # AsyncCancel / fixed-close ops: no in-flight slot, no awaiter).
         self._untracked: set[int] = set()
+        # Regular opens whose awaiter was cancelled still need their returned
+        # fd closed when the completion arrives.
+        self._open_ids: set[int] = set()
         # Fixed-file slots for linked open→I/O chains (empty when the kernel
         # lacks sparse fixed-file registration; callers then fall back).
         self._slots: collections.deque[int] = collections.deque(
@@ -187,6 +201,8 @@ class Driver:
             self._flush_retries = 0
             for ident in failed:
                 fut = self._futures.pop(ident, None)
+                self._open_ids.discard(ident)
+                self._recycle_on_done.pop(ident, None)
                 self._release_slot()
                 if fut is not None and not fut.done():
                     fut.set_exception(
@@ -214,9 +230,14 @@ class Driver:
                 # recycle the fixed-file slot if one was waiting on this close.
                 self._untracked.discard(ident)
                 slot = self._recycle_on_done.pop(ident, None)
-                if slot is not None:
+                if slot is not None and result >= 0:
                     self._slots.append(slot)
                 continue
+            slot = self._recycle_on_done.pop(ident, None)
+            if slot is not None and result >= 0:
+                self._slots.append(slot)
+            was_open = ident in self._open_ids
+            self._open_ids.discard(ident)
             chain = self._chains.pop(ident, None)
             if chain is not None:
                 chain.remaining -= 1
@@ -232,6 +253,11 @@ class Driver:
             self._release_slot()
             fut = self._futures.pop(ident, None)
             if fut is None or fut.done():
+                if was_open and result >= 0:
+                    try:
+                        os.close(result)
+                    except OSError:
+                        pass
                 continue
             try:
                 if result < 0:
@@ -264,7 +290,9 @@ class Driver:
         self._untracked.add(cid)
         self._schedule_flush()
 
-    async def _run(self, submit) -> tuple[int, Any]:
+    async def _run(
+        self, submit, *, cancel_kernel: bool = True, opens_fd: bool = False
+    ) -> tuple[int, Any]:
         """Submit via ``submit`` (returns an id) and await its completion."""
         if self._closed:
             raise RuntimeError('driver is closed')
@@ -278,10 +306,20 @@ class Driver:
             raise
         # Queue the kernel-enter for the end of this tick so SQEs batch.
         self._schedule_flush()
+        fut = self._await_id(ident)
         try:
-            return await self._await_id(ident)
+            return await asyncio.shield(fut) if opens_fd else await fut
         except asyncio.CancelledError:
-            self._cancel_op(ident)
+            if opens_fd:
+                # The completion may have set the future's result already,
+                # while this task was waiting to resume. In that race the
+                # descriptor still belongs to the cancelled open.
+                if fut.done():
+                    _close_abandoned_open(fut)
+                else:
+                    fut.add_done_callback(_close_abandoned_open)
+            if cancel_kernel:
+                self._cancel_op(ident)
             raise
 
     # -- operations -------------------------------------------------------
@@ -351,7 +389,12 @@ class Driver:
         await self._run(lambda r: r.submit_ftruncate(fd, length))
 
     async def open(self, path: str, flags: int, mode: int) -> int:
-        result, _ = await self._run(lambda r: r.submit_open(path, flags, mode))
+        def submit(r):
+            ident = r.submit_open(path, flags, mode)
+            self._open_ids.add(ident)
+            return ident
+
+        result, _ = await self._run(submit, opens_fd=True)
         return result
 
     async def close(self, fd: int) -> None:
@@ -499,11 +542,16 @@ class Driver:
         return result
 
     async def close_fixed(self, slot: int) -> None:
-        """Close the direct descriptor in ``slot`` and recycle the slot."""
-        try:
-            await self._run(lambda r: r.submit_close_fixed(slot))
-        finally:
-            self._slots.append(slot)
+        """Recycle the slot only after a successful close completion."""
+
+        def submit(r):
+            ident = r.submit_close_fixed(slot)
+            self._recycle_on_done[ident] = slot
+            return ident
+
+        # If the awaiter is cancelled, the close still owns this slot until it
+        # completes. The completion handler recycles it independently.
+        await self._run(submit, cancel_kernel=False)
 
     def close_fixed_nowait(self, slot: int) -> None:
         """Fire-and-forget close of ``slot``. The slot returns to the pool only
@@ -540,6 +588,7 @@ class Driver:
         self._futures.clear()
         self._unflushed.clear()
         self._untracked.clear()
+        self._open_ids.clear()
         self._chains.clear()
         self._recycle_on_done.clear()
         # Also wake any coroutines parked waiting for an in-flight slot, or they

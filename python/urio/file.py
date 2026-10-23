@@ -812,32 +812,38 @@ async def _open(
     name = fspath if isinstance(fspath, str) else os.fsdecode(fspath)
 
     fd = await backend.open(name, flags, 0o666)
-    size = 0
-    if appending:
-        # Size the fd we actually opened, not the path: the name may already
-        # point elsewhere (renamed/replaced concurrently), and the fd stat is
-        # one path resolution cheaper.
-        try:
-            size = await backend.filesize(fd)
-        except OSError:
-            size = 0
+    try:
+        size = 0
+        if appending:
+            # Size the fd we actually opened, not the path: the name may already
+            # point elsewhere (renamed/replaced concurrently), and the fd stat is
+            # one path resolution cheaper.
+            try:
+                size = await backend.filesize(fd)
+            except OSError:
+                size = 0
 
-    raw = AsyncBufferedFile(
-        fd,
-        name=name,
-        mode=mode,
-        readable=readable,
-        writable=writable,
-        appending=appending,
-        size=size,
-    )
-    if binary:
-        return raw
-    if encoding is None:
-        encoding = locale.getpreferredencoding(False)
-    if errors is None:
-        errors = 'strict'
-    return AsyncTextFile(raw, encoding=encoding, errors=errors, newline=newline)
+        raw = AsyncBufferedFile(
+            fd,
+            name=name,
+            mode=mode,
+            readable=readable,
+            writable=writable,
+            appending=appending,
+            size=size,
+        )
+        if binary:
+            return raw
+        if encoding is None:
+            encoding = locale.getpreferredencoding(False)
+        if errors is None:
+            errors = 'strict'
+        return AsyncTextFile(raw, encoding=encoding, errors=errors, newline=newline)
+    except BaseException:
+        # Codec construction and append sizing happen after open. Release the
+        # descriptor if either fails or the task is cancelled at that point.
+        await asyncio.shield(backend.close(fd))
+        raise
 
 
 class _OpenContext:

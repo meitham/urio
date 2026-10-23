@@ -1,18 +1,26 @@
 # Raw benchmark samples
 
-Every file here is the `--json` output of `bench_vs_aiofiles.py` — the **raw
-per-iteration wall-clock samples** (not just a summary), plus a `meta` block
-(Python version, GIL state, platform, backend). Keeping the raw samples means any
-statistic — median, mean, best, percentiles — can be recomputed later without
-re-running, and the charts in `docs/benchmarks.md` (which report **medians**)
-stay auditable.
+Each JSON file contains wall-clock samples from `bench_vs_aiofiles.py`.
+Each sample times a concurrent workload, including file opens and closes;
+it is measured in seconds. The charts in `docs/benchmarks.md` are generated
+from these files by `scripts/plot_benchmarks.py`. A speedup is the aiofiles
+median divided by the urio median.
 
-CPython **3.14** is the primary version — the charts in `docs/benchmarks.md` are
-its medians. The same Linux benchmark is run on **two boxes** to show filesystem
-impact: **ext4 on a SATA HDD** and **ZFS** (the `-zfs` files). Free-threading is
-validated on **3.14t and 3.15.0b3t** (PyO3 0.29, urio's binding, does not support
-the free-threaded build below 3.14). The 3.12 and armv7l files are kept for
-reference.
+The historical files record Python version, GIL state, platform, and backend.
+They do not record the exact source commit, dependency versions, or command
+line. The current runner records dependency versions, options, and installed
+code hashes; it records the commit when run from a Git checkout. The size
+and file count change together across the matrix, and contenders were always
+measured in the same order. The hardware descriptions below come from the
+original run notes; they are not fields in the historical JSON.
+Separate file sets prevent direct reuse but cannot remove system-wide cache
+or writeback effects. Use `--reverse-order` in a second run to check how much
+the order matters.
+
+The charts use CPython 3.14 and 3.14t data. The ext4 and ZFS results come
+from different Linux machines, so they cannot isolate filesystem effects.
+The 3.15t file is from a **3.15.0b3t** prerelease; it does not measure the
+final 3.15 interpreter. The 3.12 and armv7l files are retained for reference.
 
 | File | Hardware | Python | Backend |
 |---|---|---|---|
@@ -34,6 +42,15 @@ reference.
 The Windows and armv7 files are split per file-count because their light matrices
 ran each size class separately (the full 2000-file matrix saturates those small
 boxes). x86_64 Linux/macOS files each hold the full default matrix.
+
+The ARM files contain three repetitions per workload and have wide sample
+ranges. Several Windows and ZFS rows also vary substantially. Differences
+close to a ratio of 1 are unresolved by these runs.
+
+[Validation runs from 23 October 2026](validation-2026-10-23/README.md)
+include forward and reverse order samples on Linux/ZFS and macOS/APFS.
+They use the current 0.2.0 source and show where older conclusions do
+and do not repeat. The old chart files remain historical snapshots.
 
 Recompute a statistic, e.g. the mean instead of the median:
 

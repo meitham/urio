@@ -45,7 +45,8 @@ automatically.
 pip install urio
 ```
 
-Prebuilt abi3 wheels (one per platform covers every CPython ≥ 3.12):
+Prebuilt `abi3` wheels cover regular CPython 3.12 and newer, including 3.15.
+Free-threaded CPython 3.14t and 3.15t have separate wheels:
 
 | Platform | Arch | Backend |
 |---|---|---|
@@ -148,83 +149,22 @@ using a buffer that Python has freed or moved.
 
 ## Benchmarks
 
-`benchmarks/bench_vs_aiofiles.py` runs the full cartesian product of
-{buffered write, write+fsync, read} × {binary, text} × {2000×4 KB, 500×64 KB,
-100×1 MB, 20×8 MB}, plus a streaming read of a 128 MB file. The cache is
-warmed for every contender, each contender writes to its own files (so none
-inherits another's writeback pressure), and the median of N runs is reported
-with the [min–max] range. The Linux charts below are medians on CPython
-3.14.6, measured on a 4-core Intel i5-6500, 32 GB RAM, ext4 on a SATA HDD
-(the Windows numbers are from a separate 8-core machine; full specifications
-in [the benchmarks doc](docs/benchmarks.md)). Treat the numbers as indicative
-and run the benchmark on your own hardware. Each bar is one
-`operation × mode × size`; colour is the file size, and a bar past the 1.0×
-line means urio was faster than aiofiles.
+The [benchmark](benchmarks/bench_vs_aiofiles.py) compares concurrent file
+workloads with aiofiles. Each timing includes opening, operating on, and
+closing a batch of files. Results are batch wall-clock times, not latency
+per file.
 
-**Linux, io_uring.** Buffered writes are faster across sizes: submission
-batching for small files (one `io_uring_enter` per loop tick instead of one
-system call per operation), zero-copy submission for large ones. Reads are
-faster at small and medium sizes; reads are zero-copy (the kernel fills the
-returned `bytes` directly) and large reads fan out to io-wq workers so their
-copies run on multiple cores. Durable (`fsync`) writes converge on disk
-bandwidth and remain competitive:
+In [October 2026 validation runs](benchmarks/data/validation-2026-10-23/README.md)
+using the current source, io_uring was faster than aiofiles for 4 KB and
+64 KB binary batches on one Linux/ZFS host in both contender orders. It was
+slower for 8 MB warm binary reads. On a Mac, the thread backend and
+aiofiles were close for small reads; large buffered writes varied widely
+between runs. These are observations on those machines, not expected
+speedups on other storage.
 
-![Linux io_uring speedup vs aiofiles](docs/assets/bench-linux.svg)
-
-**Windows, IOCP.** Asynchronous I/O via overlapped I/O and a completion port,
-reaped on the event-loop thread, with zero-copy writes and reads. Buffered
-writes are at parity or faster, durable writes and large text are faster;
-binary reads remain slower, because a warm `ReadFile` completes synchronously
-and the kernel copies inline on the loop thread. The full test suite and a
-concurrency/cancellation stress test pass on Windows CPython 3.14, both GIL
-and free-threaded builds:
-
-![Windows IOCP speedup vs aiofiles](docs/assets/bench-windows.svg)
-
-**Free-threaded Python (no-GIL).** The native module declares
-`gil_used = false`, and urio has the same thread-pool mode aiofiles does, so
-nothing is lost on no-GIL builds: the thread backend matches aiofiles for
-warm reads, and io_uring/IOCP keep their advantage for writes, `fsync`, and
-latency-bound I/O. The chart isolates how the native backends' warm-read
-margin changes as the thread pools gain real parallelism: on Linux the
-small-read margin narrows but remains ahead at every size, while on Windows
-the IOCP large-text-read advantage drops below parity without the GIL:
-
-![Free-threading GIL vs no-GIL — io_uring and IOCP](docs/assets/bench-nogil.svg)
-
-Summary against aiofiles (medians, CPython 3.14):
-
-- Linux writes are 3.4–5.2× faster at small/medium sizes through submission
-  batching; large binary writes use zero-copy submission (1.7× at 1 MB,
-  parity at 8 MB). Large text writes remain slower (0.6–0.7×); offloading
-  multi-megabyte encodes off the event loop roughly halved that gap in 0.2.0.
-- Linux reads are 2.6–3.4× faster at small/medium sizes. With zero-copy reads
-  and the io-wq punt, large binary reads reach 0.8× (1 MB) and 0.5× (8 MB)
-  under the GIL, and 1.2× at 8 MB without it; large text reads are 1.7–2.0×
-  faster. Streaming a warm 128 MB file runs at 6.3 GB/s against aiofiles's
-  3.1 (2.0×).
-- Durable (`fsync`) writes converge on disk bandwidth and are competitive on
-  both io_uring and IOCP. On ZFS every `fsync` forces a ZIL/txg commit, so
-  large durable writes are roughly 24–71× slower there; aiofiles pays the
-  same cost (speedup stays near 1.0×) and urio's batched `fsync` remains
-  faster for many small files. See
-  [the benchmarks doc](docs/benchmarks.md#filesystem-impact-ext4-vs-zfs).
-- Windows IOCP: buffered writes at parity or faster, durable writes 1.1–1.7×
-  faster, large text 1.3–1.9× faster; binary reads are slower (the warm
-  `ReadFile` copy runs inline on the loop thread).
-- The thread backend matches aiofiles for reads and writes on every OS and in
-  both GIL states; it is the same strategy, used wherever io_uring or IOCP is
-  unavailable or not selected.
-- Network filesystems (measured on loopback NFSv4 and SMB 3.1.1 mounts):
-  concurrent small-file reads remain 2–4.5× faster, warm and cold, because
-  batched submission hides the per-file round-trip even though the kernel
-  hands network-filesystem I/O to worker threads; large-file reads are at
-  parity (0.9–1.1×). One report measured a 9p mount slower (about 0.7×), so
-  benchmark unusual transports before adopting.
-
-To reproduce: `python benchmarks/bench_vs_aiofiles.py --markdown --json out.json`
-(medians and raw samples). Methodology and full tables are in the
-[benchmarks docs](docs/benchmarks.md); raw sample data is in `benchmarks/data/`.
+The [benchmark documentation](docs/benchmarks.md) explains the workloads,
+shows the archived Linux and Windows results, and describes their limits.
+All [raw samples](benchmarks/data/README.md) are available for inspection.
 
 ## Documentation
 

@@ -73,3 +73,15 @@ async def test_stat_result_fields_match_os(backend, tmp_path):
     assert st.st_mode == ref.st_mode
     assert st.st_ino == ref.st_ino
     assert st.st_mtime_ns == ref.st_mtime_ns
+
+
+async def test_iocp_handle_errors_are_reported(backend):
+    if backend != 'iocp':
+        pytest.skip('Windows IOCP only')
+    active = get_backend()
+    with pytest.raises(OSError):
+        await active.fsync(-1)
+    with pytest.raises(OSError):
+        await active.filesize(-1)
+    with pytest.raises(OSError):
+        await active.ftruncate(-1, 0)

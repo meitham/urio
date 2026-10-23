@@ -14,6 +14,14 @@ skip_on_windows = pytest.mark.skipif(
     sys.platform == 'win32', reason='POSIX-only filesystem semantics'
 )
 
+
+async def test_resolve_strict_missing_path(backend, tmp_path):
+    missing = tmp_path / 'missing'
+    with pytest.raises(FileNotFoundError):
+        await urio.Path(missing).resolve(strict=True)
+    assert await urio.Path(missing).resolve(strict=False) == urio.Path(missing)
+
+
 # -- pure path behaviour (no I/O, no backend needed) ----------------------
 
 

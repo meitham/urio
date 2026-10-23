@@ -8,6 +8,31 @@ import pytest
 import urio
 
 
+async def test_invalid_text_encoding_closes_opened_file(backend, tmpfile, monkeypatch):
+    tmpfile.write_bytes(b'x')
+    active = urio.get_backend()
+    original_open = active.open
+    original_close = active.close
+    opened = []
+    closed = []
+
+    async def tracked_open(*args):
+        fd = await original_open(*args)
+        opened.append(fd)
+        return fd
+
+    async def tracked_close(fd):
+        closed.append(fd)
+        await original_close(fd)
+
+    monkeypatch.setattr(active, 'open', tracked_open)
+    monkeypatch.setattr(active, 'close', tracked_close)
+    with pytest.raises(LookupError):
+        await urio.open(tmpfile, 'r', encoding='not-a-real-codec')
+    assert len(opened) == 1
+    assert closed == opened
+
+
 async def test_text_crlf_across_chunk_boundary(backend, tmpfile):
     # given: a CRLF that straddles the 128 KB internal read-chunk boundary
     from urio.file import DEFAULT_CHUNK

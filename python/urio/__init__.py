@@ -59,7 +59,14 @@ async def aclose() -> None:
     created on the next operation).
     """
     loop = _asyncio.get_running_loop()
+    closed_poller = False
     for name in ('urio.driver', 'urio.driver_iocp', 'urio.driver_iocp_proactor'):
         mod = _sys.modules.get(name)
         if mod is not None:
+            if name == 'urio.driver_iocp':
+                closed_poller = True
             mod.close_driver(loop)
+    if closed_poller:
+        # The joined poller may have queued completion batches on this loop.
+        # Run them before returning so abandoned opens release their HANDLEs.
+        await _asyncio.sleep(0)

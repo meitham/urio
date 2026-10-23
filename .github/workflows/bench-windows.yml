@@ -1,12 +1,12 @@
 name: Windows benchmark
 
-# Manual benchmark run on a windows-latest runner. Shared virtual hardware:
-# absolute numbers are indicative only, but same-runner ratios (urio vs
-# aiofiles, and between URIO_IOCP_EXECUTOR_READ_MIN settings on branches
-# that support it) are meaningful.
+# A hosted runner is shared virtual hardware. Keep the raw samples and
+# compare both contender orders before interpreting a ratio.
 
 on:
   workflow_dispatch:
+  push:
+    branches: [benchmark/windows-validation-2026-10-23]
 
 jobs:
   bench:
@@ -24,21 +24,28 @@ jobs:
           pip install maturin aiofiles
           maturin build --release --out dist
           pip install --no-index --find-links dist urio
-      - name: Bench IOCP (executor read route off)
+      - name: Compare normal and reversed contender order
+        shell: pwsh
         env:
           URIO_WINDOWS_IOCP: '1'
-          URIO_IOCP_EXECUTOR_READ_MIN: '0'
-        run: python benchmarks/bench_vs_aiofiles.py --markdown --json bench-off.json
-      - name: Bench IOCP (executor reads at 256 KB)
-        env:
-          URIO_WINDOWS_IOCP: '1'
-          URIO_IOCP_EXECUTOR_READ_MIN: '262144'
-        run: python benchmarks/bench_vs_aiofiles.py --markdown --json bench-256k.json
-      - name: Bench IOCP (executor reads at 64 KB)
-        env:
-          URIO_WINDOWS_IOCP: '1'
-          URIO_IOCP_EXECUTOR_READ_MIN: '65536'
-        run: python benchmarks/bench_vs_aiofiles.py --markdown --json bench-64k.json
+        run: |
+          $cases = @(
+            @{ Label = '4k'; Files = 300; Size = 4096 },
+            @{ Label = '64k'; Files = 150; Size = 65536 },
+            @{ Label = '8m'; Files = 10; Size = 8388608 }
+          )
+          foreach ($case in $cases) {
+            $common = @('--files', $case.Files, '--size', $case.Size,
+              '--mode', 'both', '--no-stream', '--repeat', '7', '--warmup', '2')
+            $orders = @('forward', 'reverse', 'reverse', 'forward')
+            for ($i = 0; $i -lt $orders.Length; $i++) {
+              $order = $orders[$i]
+              $extra = @()
+              if ($order -eq 'reverse') { $extra = @('--reverse-order') }
+              python benchmarks/bench_vs_aiofiles.py @common @extra --json "bench-$($case.Label)-$i-$order.json"
+              if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            }
+          }
       - uses: actions/upload-artifact@v4
         if: always()
         with:

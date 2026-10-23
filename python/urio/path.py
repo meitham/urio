@@ -320,7 +320,8 @@ class AsyncPath:
         return self._wrap(pathlib.Path(await get_backend().readlink(str(self._path))))
 
     async def resolve(self, strict=False):
-        return self._wrap(pathlib.Path(await get_backend().realpath(str(self._path))))
+        path = await get_backend().realpath(str(self._path), strict=strict)
+        return self._wrap(pathlib.Path(path))
 
     def absolute(self):
         return self._wrap(self._path.absolute())

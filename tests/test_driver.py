@@ -2,6 +2,7 @@
 """Concurrency tests: many operations in flight on one ring at once."""
 
 import asyncio
+import collections
 import gc
 import os
 import sys
@@ -11,6 +12,50 @@ import weakref
 import pytest
 
 import urio
+from urio.backend import _native_ok
+
+
+@pytest.mark.skipif(not _native_ok(), reason='io_uring not available')
+async def test_cancelled_fixed_close_recycles_only_after_success():
+    from urio.driver import Driver
+
+    class FakeRing:
+        completions = []
+
+        def submit_close_fixed(self, slot):
+            return 42
+
+        def reap(self):
+            completed, self.completions = self.completions, []
+            return completed
+
+    driver = Driver.__new__(Driver)
+    driver._loop = asyncio.get_running_loop()
+    driver._ring = FakeRing()
+    driver._closed = False
+    driver._depth = 8
+    driver._inflight = 0
+    driver._waiters = collections.deque()
+    driver._futures = {}
+    driver._unflushed = []
+    driver._untracked = set()
+    driver._open_ids = set()
+    driver._chains = {}
+    driver._recycle_on_done = {}
+    driver._slots = collections.deque()
+    driver._schedule_flush = lambda: None
+
+    task = asyncio.create_task(driver.close_fixed(7))
+    await asyncio.sleep(0)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert list(driver._slots) == []
+
+    driver._ring.completions = [(42, 0, None)]
+    driver._reap()
+    assert list(driver._slots) == [7]
+    assert driver._inflight == 0
 
 
 async def test_many_concurrent_writes_and_reads(backend, tmp_path):

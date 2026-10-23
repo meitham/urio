@@ -90,3 +90,46 @@ async def test_close_drains_orphans_on_every_backend(backend, tmpfile):
 
     # then: the close completed and the orphan registry is clean
     assert fd not in backend_mod._orphans
+
+
+async def test_cancelled_thread_open_closes_late_descriptor(tmpfile, monkeypatch):
+    tmpfile.write_bytes(b'x')
+    started = threading.Event()
+    release = threading.Event()
+    opened = threading.Event()
+    descriptors = []
+    original_open = os.open
+
+    def slow_open(path, flags, mode):
+        started.set()
+        release.wait(5)
+        fd = original_open(path, flags, mode)
+        descriptors.append(fd)
+        opened.set()
+        return fd
+
+    monkeypatch.setattr(backend_mod.os, 'open', slow_open)
+    task = asyncio.create_task(ThreadBackend().open(str(tmpfile), os.O_RDONLY, 0o644))
+    try:
+        assert await asyncio.to_thread(started.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        release.set()
+        assert await asyncio.to_thread(opened.wait, 5)
+        # Let the executor completion callback close the orphaned descriptor.
+        for _ in range(100):
+            try:
+                os.fstat(descriptors[0])
+            except OSError:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail('cancelled open left its descriptor open')
+    finally:
+        release.set()
+        if descriptors:
+            try:
+                os.close(descriptors[0])
+            except OSError:
+                pass

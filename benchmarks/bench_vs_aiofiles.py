@@ -1,11 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark urio (io_uring and thread backends) against aiofiles.
-
-`aiofiles` pioneered ergonomic async file access for asyncio, and urio's
-thread-pool backend deliberately mirrors its approach for platforms without a
-native async filesystem interface (for example macOS). On Linux, urio adds an
-io_uring backend that submits real asynchronous I/O instead of parking a thread
-per operation -- this benchmark shows what that buys across file sizes.
+"""Compare urio backends with aiofiles on concurrent file workloads.
 
 Usage::
 
@@ -13,10 +7,9 @@ Usage::
     python benchmarks/bench_vs_aiofiles.py --markdown       # tables for docs
     python benchmarks/bench_vs_aiofiles.py --files 500 --size 65536
 
-Each scenario runs many file operations concurrently -- the regime where a real
-async backend should pull ahead, since it does not need a thread per in-flight
-operation. Reads are served warm from the page cache, so they measure the
-async machinery overhead rather than disk latency.
+Each scenario times a batch of opens, reads or writes, and closes. Results are
+wall-clock times for the whole batch, not per-operation latency. The default
+read test warms the page cache; --cold requests eviction but does not verify it.
 """
 
 from __future__ import annotations
@@ -55,8 +48,8 @@ class Result(NamedTuple):
     be derived later — median, mean, best, percentiles — without re-running, and
     so ``--json`` can persist the raw data. Reporting defaults to the **median**
     plus the ``[lo, hi]`` range: the minimum ("best of N") is the single
-    luckiest, least-contended run and hides variance. For rigorous A/B work
-    raise ``--repeat`` (and ideally run several processes — see pyperf).
+    luckiest, least-contended run and hides variance. Repeat the whole process
+    in both contender orders to check whether the comparison is stable.
     """
 
     samples: tuple[float, ...]
@@ -89,9 +82,8 @@ class Result(NamedTuple):
 
 
 async def _timeit(coro_factory, repeat, warmup, setup=None):
-    # Untimed warm-up runs so every contender enters timing from an identical
-    # state. `setup` (if given) runs untimed before EACH timed iteration -- used
-    # in cold mode to evict the page cache so every read actually hits storage.
+    # Warm up the contender before timing. Setup, if given, runs before each
+    # timed iteration; cache eviction is a best-effort request.
     for _ in range(warmup):
         await coro_factory()
     samples = []
@@ -105,8 +97,7 @@ async def _timeit(coro_factory, repeat, warmup, setup=None):
 
 
 def _warm_cache(paths):
-    """Pull every file into the page cache with a neutral, synchronous reader,
-    so the read phase starts warm for all contenders regardless of order."""
+    """Read files synchronously before timing to populate the page cache."""
     for p in paths:
         try:
             with open(p, 'rb') as f:
@@ -117,10 +108,7 @@ def _warm_cache(paths):
 
 
 def _evict_cache(paths):
-    """Drop each file from the page cache so the next read hits storage. We
-    fsync first (DONTNEED only evicts clean pages) then advise the kernel to
-    discard the file's cached pages. This measures io_uring's real target:
-    latency-bound, cold-cache I/O rather than a warm memcpy."""
+    """Request eviction of file pages; DONTNEED does not guarantee a disk read."""
     for p in paths:
         try:
             fd = os.open(p, os.O_RDONLY)
@@ -146,8 +134,8 @@ async def urio_write(opener, paths, payload, mode, syncer=None):
         async with opener(p, mode) as f:
             await f.write(payload)
             if syncer is not None:
-                # Durable write: force the data to disk before closing, so the
-                # timing reflects real I/O cost rather than the page-cache burst.
+                # Request an fsync before closing, including its latency in
+                # the timed workload.
                 await syncer(f)
 
     await asyncio.gather(*(one(p) for p in paths))
@@ -203,8 +191,8 @@ CONTENDERS = [
 ]
 
 
-def _available():
-    """Filter contenders to those usable here (skip uring if unavailable)."""
+def _available(reverse=False):
+    """Filter contenders to those usable here, preserving the requested order."""
     out = []
     for label, name, opener, syncer in CONTENDERS:
         if name is not None:
@@ -214,7 +202,7 @@ def _available():
                 continue
         out.append((label, name, opener, syncer))
     urio.set_backend('auto')
-    return out
+    return list(reversed(out)) if reverse else out
 
 
 def _select(name):
@@ -238,7 +226,9 @@ def _safe(label):
     return label.replace('[', '_').replace(']', '')
 
 
-async def run_matrix(matrix, modes, repeat, warmup, workdir, markdown, cold=False):
+async def run_matrix(
+    matrix, modes, repeat, warmup, workdir, markdown, cold=False, reverse=False
+):
     rows = []
     for label, n_files, size in matrix:
         for mode_name, binary in modes:
@@ -249,10 +239,10 @@ async def run_matrix(matrix, modes, repeat, warmup, workdir, markdown, cold=Fals
             write_times = {}
             fsync_times = {}
             read_times = {}
-            # Each contender gets its OWN file set so it never inherits another
-            # contender's dirty-page / writeback pressure -- the ordering of
-            # contenders cannot advantage or penalise any one of them.
-            for blabel, name, opener, syncer in _available():
+            # Separate file sets avoid direct reuse of the preceding
+            # contender's files. Global cache and writeback effects can still
+            # depend on order; --reverse-order offers a sensitivity check.
+            for blabel, name, opener, syncer in _available(reverse):
                 _select(name)
                 cdir = os.path.join(workdir, f'{label}_{mode_name}_{_safe(blabel)}')
                 os.makedirs(cdir, exist_ok=True)
@@ -266,8 +256,7 @@ async def run_matrix(matrix, modes, repeat, warmup, workdir, markdown, cold=Fals
                     repeat,
                     warmup,
                 )
-                # Durable write: same write, then fsync each file to disk. Far
-                # more stable than buffered writes, which only hit the cache.
+                # Same write, followed by an fsync on each file.
                 fsync_times[blabel] = await _measure(
                     lambda o=opener, p=dpaths, d=payload, m=wmode, s=syncer: urio_write(
                         o, p, d, m, s
@@ -275,7 +264,7 @@ async def run_matrix(matrix, modes, repeat, warmup, workdir, markdown, cold=Fals
                     repeat,
                     warmup,
                 )
-                # Cold: evict before each timed read so it hits storage.
+                # Cold: request eviction before each timed read.
                 # Warm: prime the cache once so the read is measured warm.
                 if cold:
                     read_setup = lambda p=paths: _evict_cache(p)  # noqa: E731
@@ -300,7 +289,9 @@ async def run_matrix(matrix, modes, repeat, warmup, workdir, markdown, cold=Fals
     return rows
 
 
-async def run_stream(modes, repeat, warmup, workdir, markdown, cold=False):
+async def run_stream(
+    modes, repeat, warmup, workdir, markdown, cold=False, reverse=False
+):
     stream_rows = []
     for mode_name, binary in modes:
         path = os.path.join(workdir, f'stream_{mode_name}.bin')
@@ -316,7 +307,7 @@ async def run_stream(modes, repeat, warmup, workdir, markdown, cold=False):
             s_warmup = warmup
 
         times = {}
-        for blabel, name, opener, _syncer in _available():
+        for blabel, name, opener, _syncer in _available(reverse):
             _select(name)
             times[blabel] = await _measure(
                 lambda o=opener, p=path, m=rmode: stream_read(o, p, m),
@@ -330,17 +321,70 @@ async def run_stream(modes, repeat, warmup, workdir, markdown, cold=False):
     return stream_rows
 
 
-def _dump_json(path, rows, stream_rows):
+def _dump_json(path, rows, stream_rows, args):
     """Persist every raw sample so any statistic (mean/median/best/percentile)
     can be computed later without re-running the benchmark."""
+    import hashlib
+    import importlib.metadata
     import json
+    import pathlib
+    import platform
+    import subprocess
     import sys
+    from datetime import datetime, timezone
+
+    def package_digest(package):
+        """Identify the installed code, including the platform extension."""
+        root = pathlib.Path(package.__file__).parent
+        digest = hashlib.sha256()
+        for file in sorted(root.rglob('*')):
+            if file.is_file() and file.suffix in {'.py', '.so', '.pyd'}:
+                digest.update(file.relative_to(root).as_posix().encode())
+                digest.update(b'\0')
+                digest.update(file.read_bytes())
+        return digest.hexdigest()
+
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    try:
+        commit = subprocess.check_output(
+            ['git', 'rev-parse', 'HEAD'],
+            cwd=repo,
+            stderr=subprocess.DEVNULL,
+            text=True,
+        ).strip()
+        dirty = bool(
+            subprocess.check_output(
+                ['git', 'status', '--porcelain'],
+                cwd=repo,
+                stderr=subprocess.DEVNULL,
+            )
+        )
+    except (OSError, subprocess.CalledProcessError):
+        commit = None
+        dirty = None
 
     data = {
         'meta': {
             'python': sys.version.split()[0],
             'gil': getattr(sys, '_is_gil_enabled', lambda: True)(),
             'platform': sys.platform,
+            'platform_detail': platform.platform(),
+            'urio_version': urio.__version__,
+            'aiofiles_version': importlib.metadata.version('aiofiles'),
+            'urio_files_sha256': package_digest(urio),
+            'aiofiles_files_sha256': package_digest(aiofiles),
+            'benchmark_sha256': hashlib.sha256(
+                pathlib.Path(__file__).read_bytes()
+            ).hexdigest(),
+            'completed_at_utc': datetime.now(timezone.utc).isoformat(),
+            'git_commit': commit,
+            'git_dirty': dirty,
+            'repeat': args.repeat,
+            'warmup': args.warmup,
+            'cold_requested': args.cold,
+            'reverse_order': args.reverse_order,
+            'workdir_parent': os.path.realpath(args.directory or tempfile.gettempdir()),
+            'sample_unit': 'seconds',
             'backend': urio.get_backend().name,
             'stream_bytes': STREAM_SIZE,
             'stream_chunk': STREAM_CHUNK,
@@ -488,16 +532,52 @@ async def main():
     parser.add_argument('--markdown', action='store_true')
     parser.add_argument('--no-stream', action='store_true')
     parser.add_argument(
+        '--directory',
+        metavar='PATH',
+        help='parent directory for temporary benchmark files',
+    )
+    parser.add_argument(
         '--cold',
         action='store_true',
-        help='evict the page cache before each read (latency-bound, not warm)',
+        help='request page-cache eviction before reads (not verified)',
+    )
+    parser.add_argument(
+        '--reverse-order',
+        action='store_true',
+        help='measure contenders in reverse order to check order sensitivity',
     )
     args = parser.parse_args()
+    if args.cold and not hasattr(os, 'posix_fadvise'):
+        parser.error('--cold requires os.posix_fadvise on this platform')
+    if (args.files is None) != (args.size is None):
+        parser.error('--files and --size must be specified together')
+    if args.files is not None and args.files < 1:
+        parser.error('--files must be positive')
+    if args.size is not None and args.size < 1:
+        parser.error('--size must be positive')
+    if args.repeat < 1:
+        parser.error('--repeat must be positive')
+    if args.warmup < 0:
+        parser.error('--warmup cannot be negative')
+    if args.directory is not None and not os.path.isdir(args.directory):
+        parser.error('--directory must name an existing directory')
 
-    if args.files and args.size:
+    if args.files is not None:
         matrix = [('custom', args.files, args.size)]
     else:
         matrix = DEFAULT_MATRIX
+
+    if os.name == 'posix':
+        import resource
+
+        soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+        needed = max(n_files for _, n_files, _ in matrix) + 64
+        if soft_limit != resource.RLIM_INFINITY and soft_limit < needed:
+            parser.error(
+                f'this matrix needs at least {needed} open file descriptors '
+                f'(current soft limit: {soft_limit}); raise it with '
+                f'`ulimit -n {needed}` or reduce --files'
+            )
 
     all_modes = [('binary', True), ('text', False)]
     if args.mode == 'binary':
@@ -507,7 +587,7 @@ async def main():
     else:
         modes = all_modes
 
-    workdir = tempfile.mkdtemp(prefix='urio-bench-')
+    workdir = tempfile.mkdtemp(prefix='urio-bench-', dir=args.directory)
     try:
         if not args.markdown:
             cache = 'COLD cache' if args.cold else 'warm cache'
@@ -516,15 +596,28 @@ async def main():
                 f'median of {args.repeat}, [min-max] shown)\n'
             )
         rows = await run_matrix(
-            matrix, modes, args.repeat, args.warmup, workdir, args.markdown, args.cold
+            matrix,
+            modes,
+            args.repeat,
+            args.warmup,
+            workdir,
+            args.markdown,
+            args.cold,
+            args.reverse_order,
         )
         stream_rows = []
         if not args.no_stream:
             stream_rows = await run_stream(
-                modes, args.repeat, args.warmup, workdir, args.markdown, args.cold
+                modes,
+                args.repeat,
+                args.warmup,
+                workdir,
+                args.markdown,
+                args.cold,
+                args.reverse_order,
             )
         if args.json:
-            _dump_json(args.json, rows, stream_rows)
+            _dump_json(args.json, rows, stream_rows, args)
     finally:
         urio.set_backend('auto')
         shutil.rmtree(workdir, ignore_errors=True)

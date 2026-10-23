@@ -19,6 +19,7 @@ import functools
 import io
 import os
 import sys
+import threading
 
 # Resolved lazily so importing urio never fails on a platform without the
 # native module.
@@ -58,6 +59,43 @@ def _native_ok() -> bool:
 async def _to_thread(fn, *args):
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, fn, *args)
+
+
+async def _to_thread_open(path: str, flags: int, mode: int) -> int:
+    # The worker itself owns the descriptor until the awaiting task receives
+    # it. A shared lock lets cancellation release it even if the event loop is
+    # closed before an asyncio completion callback could run.
+    lock = threading.Lock()
+    cancelled = False
+    opened_fd = None
+
+    def worker():
+        nonlocal opened_fd
+        try:
+            fd = os.open(path, flags, mode)
+        except BaseException as exc:
+            return None, exc
+        with lock:
+            if cancelled:
+                os.close(fd)
+                return None, None
+            opened_fd = fd
+        return fd, None
+
+    loop = asyncio.get_running_loop()
+    fut = loop.run_in_executor(None, worker)
+    try:
+        fd, error = await asyncio.shield(fut)
+        if error is not None:
+            raise error
+        return fd
+    except asyncio.CancelledError:
+        with lock:
+            cancelled = True
+            if opened_fd is not None:
+                os.close(opened_fd)
+                opened_fd = None
+        raise
 
 
 # Executor jobs that were cancelled after they started running, keyed by the
@@ -242,7 +280,7 @@ class ThreadBackend:
     name = 'thread'
 
     async def open(self, path: str, flags: int, mode: int) -> int:
-        return await _to_thread(os.open, path, flags, mode)
+        return await _to_thread_open(path, flags, mode)
 
     async def read(self, fd: int, offset: int, length: int) -> bytes:
         return await _to_thread_fd(fd, _pread, fd, length, offset)
@@ -321,8 +359,10 @@ class ThreadBackend:
     async def readlink(self, path: str) -> str:
         return await _to_thread(os.readlink, path)
 
-    async def realpath(self, path: str) -> str:
-        return await _to_thread(os.path.realpath, path)
+    async def realpath(self, path: str, *, strict: bool = False) -> str:
+        return await _to_thread(
+            functools.partial(os.path.realpath, path, strict=strict)
+        )
 
     async def scandir(self, path: str) -> list[str]:
         return await _to_thread(os.listdir, path)
@@ -529,8 +569,7 @@ class UringBackend(ThreadBackend):
 
 class IocpBackend(ThreadBackend):
     """Windows backend: real async read/write/open/close via IOCP, everything
-    else inherited from the thread pool. Opt-in (``URIO_WINDOWS_IOCP``),
-    production-validated on Windows 10/11 (CPython 3.14, GIL and free-threaded).
+    else inherited from the thread pool. Opt-in (``URIO_WINDOWS_IOCP``).
     See :mod:`urio.driver_iocp`."""
 
     name = 'iocp'
@@ -585,14 +624,21 @@ class IocpBackend(ThreadBackend):
         # The HANDLE isn't a C fd, so flush it with FlushFileBuffers via ctypes.
         import ctypes
 
-        await _to_thread_fd(fd, ctypes.windll.kernel32.FlushFileBuffers, fd)
+        def _flush(handle):
+            if not ctypes.windll.kernel32.FlushFileBuffers(ctypes.c_void_p(handle)):
+                raise ctypes.WinError()
+
+        await _to_thread_fd(fd, _flush, fd)
 
     async def filesize(self, fd: int) -> int:
         import ctypes
 
         def _size(handle):
             n = ctypes.c_longlong(0)
-            ctypes.windll.kernel32.GetFileSizeEx(handle, ctypes.byref(n))
+            if not ctypes.windll.kernel32.GetFileSizeEx(
+                ctypes.c_void_p(handle), ctypes.byref(n)
+            ):
+                raise ctypes.WinError()
             return n.value
 
         return await _to_thread_fd(fd, _size, fd)
@@ -603,10 +649,12 @@ class IocpBackend(ThreadBackend):
         import ctypes
 
         def _trunc(handle):
-            ctypes.windll.kernel32.SetFilePointerEx(
-                handle, ctypes.c_longlong(length), None, 0
-            )
-            ctypes.windll.kernel32.SetEndOfFile(handle)
+            win32 = ctypes.windll.kernel32
+            handle = ctypes.c_void_p(handle)
+            if not win32.SetFilePointerEx(handle, ctypes.c_longlong(length), None, 0):
+                raise ctypes.WinError()
+            if not win32.SetEndOfFile(handle):
+                raise ctypes.WinError()
 
         await _to_thread_fd(fd, _trunc, fd)
 

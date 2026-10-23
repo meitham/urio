@@ -191,12 +191,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - name: Build free-threaded wheel
         shell: bash
-        env:
-          PYTHON_FLAVOR: ${{ matrix.python }}
         run: |
           pip install 'maturin>=1.15,<2' ziglang
           if [ "$RUNNER_OS" = "Linux" ]; then
-            maturin build --release --out dist -i "python${PYTHON_FLAVOR}" --zig --compatibility manylinux_2_28
+            maturin build --release --out dist -i python --zig --compatibility manylinux_2_28
           else
             maturin build --release --out dist -i python
           fi

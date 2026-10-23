@@ -1,0 +1,51 @@
+name: ARM benchmark
+
+# A hosted ARM64 runner tests a different machine class from a Raspberry Pi.
+# Save the raw samples and compare both contender orders.
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [benchmark/arm-validation-2026-10-23]
+
+jobs:
+  bench:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.14'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'maturin>=1.15,<2' aiofiles pytest pytest-asyncio
+          maturin build --release --out dist
+          pip install --no-index --find-links dist urio
+      - name: Test
+        run: pytest -q
+      - name: Compare normal and reversed contender order
+        run: |
+          ulimit -n 4096
+          for row in '4k 300 4096' '64k 150 65536' '8m 10 8388608'; do
+            read -r label files size <<< "$row"
+            for iteration in 0 1 2 3; do
+              order=forward
+              extra=()
+              if (( iteration == 1 || iteration == 2 )); then
+                order=reverse
+                extra=(--reverse-order)
+              fi
+              python benchmarks/bench_vs_aiofiles.py \
+                --files "$files" --size "$size" --mode binary --no-stream \
+                --repeat 7 --warmup 2 "${extra[@]}" \
+                --json "bench-$label-$iteration-$order.json"
+            done
+          done
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: bench-arm-results
+          path: bench-*.json

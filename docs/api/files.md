@@ -1,169 +1,96 @@
 # File objects
 
-[`urio.open`](open.md) returns one of two file objects depending on mode. Both
-are async context managers, support async iteration, and expose a
-file-object-like surface. Every I/O method is a coroutine and must be `await`ed;
-introspection methods (`name`, `mode`, `closed`, `fileno`, `readable`,
-`writable`, `seekable`, `tell`) are synchronous.
+`urio.open()` returns a text or binary file object. I/O methods are
+coroutines; call them with `await`. Properties and methods that inspect
+the object, including `tell()` and `fileno()`, are synchronous.
 
----
+Both file types support `async with` and asynchronous iteration over lines.
 
-## Binary mode — `AsyncBufferedFile`
+## Binary files
 
-Returned for modes containing `b`. Fully positional: `seek`, `tell`, and
-`truncate` all work. A read-ahead buffer gives ordinary `read`/`readline`
-semantics on top of positioned io_uring reads.
+`AsyncBufferedFile` is returned when the mode contains `b`. It reads and
+writes bytes and keeps its own file position.
 
 ### Reading
 
-#### `await read(size=-1)`
-Read and return up to `size` bytes. With `size` omitted or negative, read until
-EOF. Returns `b''` at end of file.
+- `await read(size=-1)` returns up to `size` bytes. With no size, it reads
+  to the end of the file. It returns `b''` at end of file.
+- `await readall()` is equivalent to `await read(-1)`.
+- `await readinto(buffer)` fills a writable buffer and returns the number
+  of bytes read.
+- `await readline(size=-1)` returns one line, including its newline if
+  present. A nonnegative size limits the number of bytes.
+- `await readlines(hint=-1)` returns a list of lines. A nonnegative hint
+  stops the read after approximately that many bytes.
 
 ```python
-async with urio.open('f', 'rb') as f:
-    head = await f.read(16)
-    rest = await f.read()
-```
-
-#### `await readall()`
-Read and return all remaining bytes. Equivalent to `read(-1)`.
-
-#### `await readinto(b)`
-Read into the pre-allocated writable buffer `b` (e.g. a `bytearray`). Returns the
-number of bytes read.
-
-```python
-buf = bytearray(64)
-n = await f.readinto(buf)
-```
-
-#### `await readline(size=-1)`
-Read and return one line including the trailing `\n` (the last line may have
-none). If `size >= 0`, return at most `size` bytes.
-
-#### `await readlines(hint=-1)`
-Read and return a list of all lines. If `hint >= 0`, stop once roughly `hint`
-bytes have been read.
-
-#### Async iteration
-Iterate line by line:
-
-```python
-async with urio.open('f', 'rb') as f:
-    async for line in f:
-        process(line)
+async with urio.open('data.bin', 'rb') as file:
+    header = await file.read(16)
+    remainder = await file.read()
 ```
 
 ### Writing
 
-#### `await write(data)`
-Write the bytes-like `data` at the current position; return the number of bytes
-written. Passing a `str` raises `TypeError`.
+`await write(data)` writes a bytes-like object and returns the number of
+bytes written. `await writelines(lines)` writes an iterable of bytes-like
+objects in order. Neither method adds line separators.
 
-#### `await writelines(lines)`
-Write an iterable of bytes-like objects in order.
+### Position and size
 
-### Positioning
+`tell()` returns the current byte offset. `await seek(offset,
+whence=os.SEEK_SET)` changes the position and returns the new offset.
+`whence` may be `os.SEEK_SET`, `os.SEEK_CUR`, or `os.SEEK_END`.
+A negative resulting position raises `OSError`.
 
-#### `tell()` *(sync)*
-Return the current byte offset.
+`await truncate(size=None)` changes the file size and returns the new size.
+If `size` is omitted, the current position is used.
 
-#### `await seek(offset, whence=os.SEEK_SET)`
-Move the position. `whence` is `SEEK_SET` (absolute), `SEEK_CUR` (relative), or
-`SEEK_END` (from end, which statx's the file for its size). Returns the new
-absolute position. A resulting negative position raises `OSError`.
+### Flushing and closing
 
-#### `await truncate(size=None)`
-Truncate the file to `size` bytes (default: the current position). Returns the
-new size.
+`await flush()` does nothing: urio has no userspace write buffer.
+`await fsync()` requests that file data and metadata be flushed to storage.
+`await fdatasync()` requests a data flush; where `fdatasync` is unavailable,
+it uses `fsync`. `await close()` closes the file and may be called more than
+once.
 
-### Durability
+The following are synchronous: `name`, `mode`, `closed`, `fileno()`,
+`readable()`, `writable()`, and `seekable()`.
 
-#### `await flush()`
-No-op for compatibility — writes go straight to the kernel, so there is no
-userspace buffer to flush.
+## Text files
 
-#### `await fsync()`
-Flush file data **and** metadata to disk (`fsync(2)`).
-
-#### `await fdatasync()`
-Flush file data to disk, skipping non-essential metadata (`fdatasync(2)`).
-
-### Lifecycle & introspection
-
-| Member | Kind | Description |
-|---|---|---|
-| `await close()` | coroutine | Close the file. Idempotent. |
-| `name` | property | The path the file was opened with. |
-| `mode` | property | The mode string. |
-| `closed` | property | `True` once closed. |
-| `fileno()` | sync | Underlying OS file descriptor. |
-| `readable()` | sync | Whether reads are allowed. |
-| `writable()` | sync | Whether writes are allowed. |
-| `seekable()` | sync | Always `True` for binary files. |
-
----
-
-## Text mode — `AsyncTextFile`
-
-Returned for text modes (the default). Wraps a binary file with an incremental
-codec and universal-newline handling. Forward reading and writing are fully
-supported.
-
-It offers the same reading and writing coroutines as the binary file —
-`read`, `readline`, `readlines`, async iteration, `write`, `writelines` — but
-operating on `str`:
+`AsyncTextFile` is returned unless the mode contains `b`. It reads and
+writes `str`, using an incremental codec so characters split across
+internal reads are decoded correctly. It supports `read()`,
+`readline()`, `readlines()`, `write()`, `writelines()`, `seek()`,
+`tell()`, `flush()`, `fsync()`, `fdatasync()`, and `close()`.
 
 ```python
-async with urio.open('f.txt', encoding='utf-8') as f:
-    async for line in f:  # str lines
+async with urio.open('notes.txt', encoding='utf-8') as file:
+    async for line in file:
         print(line.rstrip())
 ```
 
-### Newline handling
+`write()` returns the number of characters in the input, before encoding
+or newline translation. `writelines()` does not insert separators.
 
-`newline` follows the semantics of the builtin `open`:
+### Newlines
 
-| `newline` | On read | On write |
+The `newline` argument to `urio.open()` controls line handling:
+
+| Value | Reading | Writing |
 |---|---|---|
-| `None` (default) | `\r\n`, `\r`, `\n` are all translated to `\n` | `\n` is translated to `os.linesep` |
-| `''` | line endings recognised but **not** translated | no translation |
-| `'\n'` | no translation | no translation |
-| `'\r'` / `'\r\n'` | that terminator is recognised | `\n` is translated to it |
+| `None` | Recognize `\n`, `\r`, and `\r\n` and return `\n`. | Translate `\n` to `os.linesep`. |
+| `''` | Recognize each ending without translating it. | Do not translate. |
+| `'\n'` | Recognize `\n` only. | Do not translate. |
+| `'\r'` or `'\r\n'` | Recognize only the specified ending. | Translate `\n` to that ending. |
 
-### Encoding
+### Seeking in text files
 
-`encoding` defaults to the locale preferred encoding; pass an explicit codec for
-portable behaviour. `errors` controls the codec error policy (`'strict'` by
-default). Multibyte sequences that straddle internal read boundaries are decoded
-correctly via an incremental decoder.
+`await seek()` accepts byte offsets and resets the decoder and newline
+state. `tell()` returns an exact byte offset when no decoded characters
+are buffered. With buffered text, the result can be approximate, especially
+after newline translation. Seeking into the middle of a multibyte character
+or newline sequence can cause the following read to decode incorrectly.
 
-!!! note "Performance"
-    Reading a whole text file (`read()` with no size) uses a fast path — one
-    read-to-EOF round-trip plus a single bulk decode — and performs at parity
-    with aiofiles. **Sized** and **streaming** text reads (`read(n)` and chunked
-    loops) still decode incrementally in Python, so they trail aiofiles' C
-    `TextIOWrapper`; for maximum text throughput read in binary and decode in
-    bulk. See the [benchmarks](../benchmarks.md).
-
-### Positioning
-
-Text streams are seekable, in **byte offsets** (like `io.TextIOWrapper`):
-
-- `await seek(offset, whence=SEEK_SET)` — `SEEK_SET`/`SEEK_CUR`/`SEEK_END` are all
-  supported; the incremental decoder and newline state are reset. Returns the new
-  byte position.
-- `tell()` — returns a byte offset: **exact** at a boundary (nothing buffered),
-  best-effort mid-buffer under universal newlines (the `\r\n`→`\n` mapping is
-  lossy). Seek to a value `tell()` returned to restore an exact position.
-
-Seeking to an arbitrary byte that splits a code point or a `\r\n` pair is allowed
-but may mis-decode the following characters — the same caveat as CPython's
-`TextIOWrapper` on a non-cookie target.
-
-### Durability & lifecycle
-
-`flush`, `fsync`, `fdatasync`, and `close` delegate to the underlying binary
-file. Introspection adds `encoding` and `errors` properties; `seekable()`
-returns `False`.
+`seekable()` returns `True`. Text files also expose `encoding` and `errors`
+properties.

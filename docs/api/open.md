@@ -1,87 +1,53 @@
 # Opening files
 
-## `urio.open`
+## `urio.open(path, mode='r', *, encoding=None, errors=None, newline=None)`
+
+Open a file and return an object that can be used as an asynchronous context
+manager or awaited directly. It yields an [`AsyncTextFile`](files.md#text-files)
+in text mode and an [`AsyncBufferedFile`](files.md#binary-files) in binary mode.
 
 ```python
-urio.open(path, mode='r', *, encoding=None, errors=None, newline=None)
+async with urio.open('notes.txt', 'w', encoding='utf-8') as file:
+    await file.write('hello\n')
 ```
 
-Open `path` and return an object that is both **awaitable** and an **async
-context manager**. Binary modes yield an [`AsyncBufferedFile`](files.md); text
-modes yield an [`AsyncTextFile`](files.md).
+The context manager closes the file when the block exits. If you await
+`urio.open()` directly, call `await file.close()` when finished:
 
-### Parameters
+```python
+file = await urio.open('notes.txt')
+try:
+    text = await file.read()
+finally:
+    await file.close()
+```
 
-| Parameter | Description |
-|---|---|
-| `path` | Path to open. Accepts `str`, `bytes`, `os.PathLike`, or a [`urio.Path`](path.md). |
-| `mode` | Mode string (see below). Defaults to `'r'` (text read). |
-| `encoding` | Text mode only. Codec name; defaults to the locale preferred encoding. Ignored in binary mode. |
-| `errors` | Text mode only. Codec error policy (e.g. `'strict'`, `'replace'`). Defaults to `'strict'`. |
-| `newline` | Text mode only. Controls universal-newline behaviour (see [text mode](files.md#text-mode-asynctextfile)). |
+`path` may be a string, bytes, or an object implementing `os.PathLike`,
+including `urio.Path`. The default mode, `'r'`, opens an existing file for
+text reading.
 
 ### Modes
 
-| Char | Meaning |
+| Character | Effect |
 |---|---|
-| `r` | Open for reading (default). |
-| `w` | Open for writing, truncating first. Creates if missing. |
-| `a` | Open for writing, appending to the end. Creates if missing. |
-| `x` | Exclusive creation; fails if the file exists. |
-| `b` | Binary mode. |
-| `t` | Text mode (default). |
-| `+` | Open for updating (reading **and** writing). |
+| `r` | Read an existing file. |
+| `w` | Write, creating the file if needed and truncating it otherwise. |
+| `a` | Append, creating the file if needed. |
+| `x` | Create a new file; raise `FileExistsError` if it exists. |
+| `b` | Return bytes. |
+| `t` | Return text; this is the default. |
+| `+` | Allow both reading and writing. |
 
-Exactly one of `r`/`w`/`a`/`x` must be present. Text (`t`) is the default unless
-`b` is given. Combining `t` and `b`, or supplying more than one primary mode,
-raises `ValueError`.
+A mode must contain exactly one of `r`, `w`, `a`, or `x`. `b` and `t`
+cannot be combined. Invalid modes raise `ValueError`.
 
-### Two ways to use it
+### Text options
 
-As an async context manager (closes automatically):
+`encoding` names the text codec. It defaults to the locale's preferred
+encoding; specify it when files need a known encoding. `errors` is the codec
+error handler and defaults to `'strict'`. `newline` controls line ending
+recognition and translation; see [text files](files.md#text-files).
+These options are ignored in binary mode.
 
-```python
-async with urio.open('file.txt', 'w') as f:
-    await f.write('hello')
-```
-
-As an awaitable (you close it yourself):
-
-```python
-f = await urio.open('file.txt', 'w')
-try:
-    await f.write('hello')
-finally:
-    await f.close()
-```
-
-### Return type by mode
-
-| Mode contains | Returns |
-|---|---|
-| `b` | [`AsyncBufferedFile`](files.md#binary-mode-asyncbufferedfile) |
-| otherwise (text) | [`AsyncTextFile`](files.md#text-mode-asynctextfile) |
-
-### Errors
-
-- `ValueError` — invalid or contradictory mode string.
-- `FileNotFoundError` — opening a missing file for reading.
-- `FileExistsError` — `x` mode when the file already exists.
-- `PermissionError`, `IsADirectoryError`, etc. — surfaced from the OS as usual.
-
-### Examples
-
-```python
-# Text, explicit encoding
-async with urio.open('u.txt', 'w', encoding='utf-8') as f:
-    await f.write('héllo')
-
-# Binary append
-async with urio.open('log.bin', 'ab') as f:
-    await f.write(b'\x01')
-
-# Read+write update mode
-async with urio.open('data', 'rb+') as f:
-    await f.seek(0)
-    header = await f.read(4)
-```
+Errors from opening the path, such as `FileNotFoundError` or
+`PermissionError`, are passed through from the operating system.

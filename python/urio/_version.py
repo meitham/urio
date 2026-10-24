@@ -5,5 +5,5 @@ from importlib.metadata import version as _dist_version
 
 try:
     __version__ = version = _dist_version('urio')
-except PackageNotFoundError:  # running from a source tree without an install
+except PackageNotFoundError:
     __version__ = version = '0.0.0+unknown'

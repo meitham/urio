@@ -1,5 +1,5 @@
 site_name: urio
-site_description: Real async file I/O for Python, powered by io_uring
+site_description: Asynchronous file and path I/O for Python
 repo_url: https://github.com/meitham/urio
 repo_name: meitham/urio
 

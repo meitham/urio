@@ -1,10 +1,5 @@
 name: Release
 
-# Wheels for every supported platform. abi3 wheels (one per platform) cover
-# all CPython >= 3.12; free-threaded interpreters cannot use abi3, so cp314t
-# wheels are built separately. Publishing runs only on version tags (vX.Y.Z)
-# and refuses to proceed if the tag disagrees with Cargo.toml, the single
-# source of truth for the version.
 
 on:
   push:
@@ -19,7 +14,7 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Tag must match Cargo.toml version
         run: |
           tag="${GITHUB_REF_NAME#v}"
@@ -28,6 +23,62 @@ jobs:
             echo "tag v$tag != Cargo.toml version $cargo_version" >&2
             exit 1
           fi
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ['3.12', '3.13', '3.14', '3.15']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and install
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'maturin>=1.15,<2' pytest pytest-asyncio
+          maturin build --release --out dist
+          python scripts/check_wheels.py dist
+          pip install --no-index --find-links dist urio
+      - run: pytest -q
+      - name: Test Windows IOCP
+        if: runner.os == 'Windows'
+        env:
+          URIO_WINDOWS_IOCP: '1'
+        run: pytest -q -o faulthandler_timeout=120
+
+  test-free-threaded:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python: ['3.14t', '3.15t']
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Build and install
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'maturin>=1.15,<2' pytest pytest-asyncio
+          maturin build --release --out dist -i python
+          python scripts/check_wheels.py dist
+          pip install --no-index --find-links dist urio
+      - run: pytest -q
+      - name: Test Windows IOCP
+        if: runner.os == 'Windows'
+        env:
+          URIO_WINDOWS_IOCP: '1'
+        run: pytest -q -o faulthandler_timeout=120
 
   linux:
     runs-on: ubuntu-latest
@@ -38,20 +89,18 @@ jobs:
           - target: x86_64
             manylinux: auto
             args: --release --out dist
-          # manylinux2014 (glibc 2.17) so the wheel runs on old-glibc ARM
-          # boards (validated on a Jetson Nano, Ubuntu 18.04).
           - target: aarch64
             manylinux: '2014'
             args: --release --out dist --zig
-          # The io-uring crate ships no 32-bit-ARM syscall bindings; the ABI
-          # structs are fixed-width so the prebuilt bindings are layout-correct
-          # (validated on a Raspberry Pi, armv7l).
           - target: armv7
             manylinux: '2014'
             args: --release --out dist --zig
             rustflags: --cfg io_uring_skip_arch_check
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
       - uses: PyO3/maturin-action@v1
         env:
           RUSTFLAGS: ${{ matrix.rustflags || '' }}
@@ -59,7 +108,8 @@ jobs:
           target: ${{ matrix.target }}
           manylinux: ${{ matrix.manylinux }}
           args: ${{ matrix.args }}
-      - uses: actions/upload-artifact@v4
+      - run: python scripts/check_wheels.py dist
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-linux-${{ matrix.target }}
           path: dist
@@ -71,13 +121,17 @@ jobs:
       matrix:
         target: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           manylinux: musllinux_1_2
           args: --release --out dist
-      - uses: actions/upload-artifact@v4
+      - run: python scripts/check_wheels.py dist
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-musllinux-${{ matrix.target }}
           path: dist
@@ -89,15 +143,16 @@ jobs:
       matrix:
         target: [x64, x86]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           args: --release --out dist
-      - uses: actions/upload-artifact@v4
+      - run: python scripts/check_wheels.py dist
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-windows-${{ matrix.target }}
           path: dist
@@ -109,54 +164,57 @@ jobs:
       matrix:
         target: [x86_64, aarch64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
       - uses: PyO3/maturin-action@v1
         with:
           target: ${{ matrix.target }}
           args: --release --out dist
-      - uses: actions/upload-artifact@v4
+      - run: python scripts/check_wheels.py dist
+      - uses: actions/upload-artifact@v6
         with:
           name: wheels-macos-${{ matrix.target }}
           path: dist
 
-  # Free-threaded CPython cannot load abi3 wheels, so build cp314t wheels per
-  # platform. PyO3 drops the abi3 restriction automatically when compiling for
-  # a free-threaded interpreter.
   free-threaded:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
+        python: ['3.14t', '3.15t']
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: '3.14t'
+          python-version: ${{ matrix.python }}
       - uses: dtolnay/rust-toolchain@stable
-      - name: Build cp314t wheel
+      - name: Build free-threaded wheel
         shell: bash
         run: |
-          pip install maturin ziglang
+          pip install 'maturin>=1.15,<2' ziglang
           if [ "$RUNNER_OS" = "Linux" ]; then
-            maturin build --release --out dist -i python3.14t --zig --compatibility manylinux_2_28
+            maturin build --release --out dist -i python --zig --compatibility manylinux_2_28
           else
             maturin build --release --out dist -i python
           fi
-      - uses: actions/upload-artifact@v4
+      - run: python scripts/check_wheels.py dist
+      - uses: actions/upload-artifact@v6
         with:
-          name: wheels-freethreaded-${{ matrix.os }}
+          name: wheels-freethreaded-${{ matrix.os }}-${{ matrix.python }}
           path: dist
 
   sdist:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: PyO3/maturin-action@v1
         with:
           command: sdist
           args: --out dist
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: sdist
           path: dist
@@ -164,18 +222,23 @@ jobs:
   publish:
     if: startsWith(github.ref, 'refs/tags/v')
     needs:
-      [check-version, linux, musllinux, windows, macos, free-threaded, sdist]
+      [check-version, test, test-free-threaded, linux, musllinux, windows, macos, free-threaded, sdist]
     runs-on: ubuntu-latest
     environment: pypi
     permissions:
-      # PyPI trusted publishing (OIDC) + creating the GitHub release.
       id-token: write
       contents: write
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - uses: actions/download-artifact@v7
         with:
           path: dist
           merge-multiple: true
+      - name: Check wheels
+        run: python scripts/check_wheels.py dist
       - name: Publish to PyPI
         uses: pypa/gh-action-pypi-publish@release/v1
         with:

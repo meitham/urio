@@ -6,10 +6,6 @@ import pytest
 import urio
 from urio.backend import _iocp_ok, _native_ok
 
-# Every I/O test runs against each real backend and the thread-pool fallback:
-# io_uring (Linux), IOCP (Windows, opt-in), and the portable thread backend.
-# A backend is skipped where it is unavailable, so the thread backend always
-# runs and the native ones run only on their platform.
 BACKENDS = ('uring', 'iocp', 'thread')
 
 

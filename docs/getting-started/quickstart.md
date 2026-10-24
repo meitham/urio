@@ -1,90 +1,92 @@
 # Quickstart
 
-Everything in urio is `async`. Run the examples below inside an event loop
-(`asyncio.run(...)`).
-
-## Writing and reading text
-
-```python
-import urio
-
-
-async def main():
-    async with urio.open('notes.txt', 'w') as f:
-        await f.write('first line\n')
-        await f.write('second line\n')
-
-    async with urio.open('notes.txt') as f:
-        content = await f.read()
-    print(content)
-```
-
-## Iterating over lines
-
-```python
-async with urio.open('notes.txt') as f:
-    async for line in f:
-        print(line.rstrip())
-```
-
-## Binary mode
-
-```python
-async with urio.open('data.bin', 'wb') as f:
-    await f.write(b'\x00\x01\x02\x03')
-
-async with urio.open('data.bin', 'rb') as f:
-    await f.seek(2)
-    print(await f.read(2))  # b'\x02\x03'
-```
-
-## Awaiting open instead of `async with`
-
-Like aiofiles, `urio.open` is both an async context manager and directly
-awaitable:
-
-```python
-f = await urio.open('notes.txt', 'a')
-try:
-    await f.write('appended\n')
-finally:
-    await f.close()
-```
-
-## Async pathlib
-
-```python
-from urio import Path
-
-
-async def main():
-    p = Path('project') / 'README.md'
-    await p.parent.mkdir(parents=True, exist_ok=True)
-    await p.write_text('# Project\n')
-
-    print(await p.exists())  # True
-    print((await p.stat()).st_size)  # 10
-    async for child in p.parent.iterdir():
-        print(child.name)
-```
-
-## Concurrency
-
-Because the native backends (io_uring, IOCP) do not occupy a thread per
-operation, large fan-out workloads scale well:
+File operations are coroutines. Use `await` for reads, writes, and closing
+files. An `async with` block closes its file when the block exits:
 
 ```python
 import asyncio
 import urio
 
 
-async def save(i):
-    async with urio.open(f'out/{i}.txt', 'w') as f:
-        await f.write(f'record {i}\n')
+async def main():
+    async with urio.open('notes.txt', 'w', encoding='utf-8') as file:
+        await file.write('first line\n')
+        await file.write('second line\n')
+
+    async with urio.open('notes.txt', encoding='utf-8') as file:
+        async for line in file:
+            print(line.rstrip())
+
+
+asyncio.run(main())
+```
+
+The remaining snippets belong inside an asynchronous function unless
+they define one themselves.
+
+Pass `'rb'` or `'wb'` for bytes. The file position can be changed with
+`await file.seek(...)`; `file.tell()` is synchronous.
+
+```python
+async with urio.open('data.bin', 'wb') as file:
+    await file.write(b'\x00\x01\x02\x03')
+
+async with urio.open('data.bin', 'rb') as file:
+    await file.seek(2)
+    assert await file.read(2) == b'\x02\x03'
+```
+
+`urio.open()` can also be awaited directly. In that case, close the file
+yourself:
+
+```python
+file = await urio.open('notes.txt', 'a', encoding='utf-8')
+try:
+    await file.write('another line\n')
+finally:
+    await file.close()
+```
+
+## Working with paths
+
+`urio.Path` has synchronous methods for path manipulation and asynchronous
+methods for filesystem access:
+
+```python
+from urio import Path
+
+path = Path('project') / 'README.md'
+await path.parent.mkdir(parents=True, exist_ok=True)
+await path.write_text('# Project\n', encoding='utf-8')
+
+print(await path.exists())
+print((await path.stat()).st_size)
+
+async for child in path.parent.iterdir():
+    print(child.name)
+```
+
+## Running operations concurrently
+
+Ordinary `asyncio` tools work with urio's coroutines:
+
+```python
+import asyncio
+from urio import Path
+
+
+async def save(number):
+    await Path('out', f'{number}.txt').write_text(f'record {number}\n')
 
 
 async def main():
-    await asyncio.gather(*(save(i) for i in range(1000)))
+    await Path('out').mkdir(exist_ok=True)
+    await asyncio.gather(*(save(number) for number in range(100)))
+
+
+asyncio.run(main())
 ```
 
-See the [benchmarks](../benchmarks.md) for measurements.
+Use a semaphore to limit concurrency when many large reads would otherwise
+hold too much data in memory. See [backends](backends.md) for how operations
+are carried out on each platform.

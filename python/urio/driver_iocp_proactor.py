@@ -21,10 +21,6 @@ import weakref
 
 from . import _uring
 
-# Cached as an attribute on the loop object so the driver dies with the loop —
-# a WeakKeyDictionary keyed by loop would leak (the driver strongly references
-# the loop, keeping the key alive). The dict is only a weak-value fallback for
-# loops that reject attribute assignment.
 _DRIVER_ATTR = '_urio_proactor_driver'
 _drivers: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
@@ -42,10 +38,6 @@ class _Ov:
         self._io = io
 
     def cancel(self) -> None:
-        # File operations run to completion regardless; there is nothing to
-        # cancel. Cleanup of an abandoned (cancelled-future) op happens in
-        # __del__, by which point the proactor has already reaped the
-        # completion, so the kernel is finished with the buffer.
         pass
 
     def __del__(self) -> None:
@@ -60,12 +52,10 @@ class ProactorDriver:
 
     def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
         self._loop = loop
-        self._proactor = loop._proactor  # type: ignore[attr-defined]
+        self._proactor = loop._proactor
         self._io = _uring.ProactorIo(self._proactor._iocp)
 
     def _complete(self, transferred, key, ov):
-        # Called by IocpProactor._poll on the loop thread; its return value
-        # becomes the future's result (or it raises OSError).
         return self._io.take(ov.address, transferred or 0)
 
     def _await_op(self, address: int, handle: int):
@@ -75,7 +65,6 @@ class ProactorDriver:
     async def open(
         self, path: str, write: bool, create: bool, truncate: bool, exclusive: bool
     ) -> int:
-        # CreateFileW is not an overlapped operation; it completes synchronously.
         return self._io.open(path, write, create, truncate, exclusive)
 
     async def read(self, handle: int, offset: int, length: int) -> bytes:

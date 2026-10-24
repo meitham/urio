@@ -1,12 +1,9 @@
 [build-system]
-requires = ["maturin>=1.7,<2.0"]
+requires = ["maturin>=1.15,<2.0"]
 build-backend = "maturin"
 
 [project]
 name = "urio"
-# The version is dynamic: maturin takes it from Cargo.toml (the single source
-# of truth). Releases are cut by tagging vX.Y.Z; the release workflow refuses
-# to publish if the tag and Cargo.toml disagree.
 dynamic = ["version"]
 description = "Real async file I/O for Python, powered by io_uring"
 authors = [
@@ -17,7 +14,7 @@ readme = "README.md"
 requires-python = ">=3.12"
 keywords = ["asyncio", "io_uring", "async", "files", "aiofiles", "pathlib"]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Framework :: AsyncIO",
     "Intended Audience :: Developers",
     "License :: OSI Approved :: MIT License",
@@ -26,6 +23,10 @@ classifiers = [
     "Operating System :: MacOS",
     "Operating System :: Microsoft :: Windows",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: 3.15",
     "Programming Language :: Rust",
     "Topic :: System :: Filesystems",
 ]
@@ -52,6 +53,7 @@ docs = [
 python-source = "python"
 module-name = "urio._uring"
 features = ["pyo3/extension-module"]
+exclude = [{ path = "benchmarks/data/**", format = "sdist" }]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -69,16 +71,16 @@ skip-magic-trailing-comma = false
 
 [tool.ruff.lint]
 select = [
-    "E",      # pycodestyle errors
-    "W",      # pycodestyle warnings
-    "F",      # pyflakes
-    "I",      # isort
-    "B",      # flake8-bugbear
-    "C4",     # flake8-comprehensions
-    "UP",     # pyupgrade
+    "E",
+    "W",
+    "F",
+    "I",
+    "B",
+    "C4",
+    "UP",
 ]
 ignore = [
-    "E501",   # line too long (handled by formatter)
+    "E501",
 ]
 
 [tool.ruff.lint.isort]

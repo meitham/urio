@@ -1,134 +1,81 @@
 # How it works
 
-urio is a bridge between Python's `asyncio` event loop and Linux io_uring.
-The native ring lives in a small Rust extension (PyO3); the async integration
-and the public API are Python.
+The public API and its `asyncio` integration are written in Python. A
+PyO3 extension implements the Linux io_uring ring and the optional Windows
+IOCP backend. The [backend guide](getting-started/backends.md) describes
+which implementation is selected.
 
-## The completion bridge
+## Linux: completions and the event loop
 
-io_uring is *completion-based*: operations are submitted to a submission
-queue, and results are later reaped from a completion queue. The problem to
-solve is waking the event loop exactly when results are ready, without a
-polling thread.
+The first operation on an event loop creates a ring. The driver gives each
+submission an identifier and keeps an `asyncio.Future` for its result.
+The ring registers an eventfd, which the event loop watches with
+`loop.add_reader()`. When the kernel posts a completion, the eventfd wakes
+the loop; the driver reads the result and resolves the corresponding future.
 
-1. A single ring is created **per event loop** (lazily, then cached as an
-   attribute of the loop object, so it is reclaimed with the loop; call
-   [`await urio.aclose()`](api/backends.md#urioaclose) to release it
-   deterministically).
-2. The ring registers an **eventfd** with io_uring (`register_eventfd`). The
-   kernel writes to that descriptor whenever completions are posted.
-3. That descriptor is handed to **`loop.add_reader(efd, ...)`**, so the event
-   loop wakes on it like any other readable descriptor.
-4. Each submission maps a `user_data` id to an `asyncio.Future`. The
-   coroutine awaits that future.
-5. On wake-up the driver **drains the eventfd**, **reaps** every completion,
-   and resolves the matching futures, setting a result or an `OSError` built
-   from `-errno` for failures.
-
-Everything runs on the loop thread. There is no executor and no background
-thread on the io_uring path; the I/O itself is asynchronous, rather than
-concurrency through threads.
-
-### Submission batching
-
-Submissions are *queued* in the ring but not entered into the kernel one at
-a time. The first submission in an event-loop tick schedules a single flush
-via `loop.call_soon`; every other submission in that tick appends a
-submission-queue entry. When the flush runs, one `io_uring_enter` carries the
-whole batch to the kernel. Many operations submitted with a single system
-call is io_uring's defining feature, and batching makes it the common case:
-a workload of 500 concurrent open+write+close operations issues about 15
-`io_uring_enter` calls instead of 1500. In-flight operations are bounded to
-the ring depth by an O(1) gate so the completion queue cannot overflow.
-
-```
-coroutine ── submit ──▶ io_uring SQ ──▶ kernel
-    ▲                                      │
-    │                                  completion
- Future.set_result                         │
-    │                                       ▼
- driver.reap ◀── add_reader wakes ◀── eventfd
+```text
+coroutine → submission queue → kernel
+    ↑                         |
+  future ← driver ← eventfd ← completion
 ```
 
-## Memory safety
+Submissions made during one event-loop turn are flushed together. The
+driver also limits the number of outstanding operations to the ring depth.
+`URIO_RING_ENTRIES` changes that depth; the default is 512.
 
-io_uring takes a pointer from the caller and returns immediately; the kernel
-reads from (write operations) or writes into (read operations) that buffer
-**asynchronously**. If the buffer were freed or moved before completion, the
-result would be corruption or a use-after-free. This is the main io_uring
-hazard.
+Operations without a supported io_uring path use the event loop's
+executor. This includes directory listing, `chmod`, `readlink`,
+`realpath`, and `utime`. `ftruncate` uses io_uring on kernels that
+support it and the executor otherwise.
 
-urio avoids it by keeping whatever the kernel touches alive in the ring's
-pending map, keyed by `user_data`, until the completion is reaped:
+## Buffers and cancellation
 
-- **Writes** submit against the caller's Python `bytes` object directly,
-  without a copy, holding a reference to it in the pending map. This is safe
-  because `bytes` is immutable and CPython never relocates it, so the pointer
-  stays valid and the held reference prevents deallocation. `writelines`
-  submits one vectored `writev` with an iovec per line, so a whole batch
-  reaches the kernel from the lines' own buffers with no join copy.
-- **Reads are zero-copy as well**: the kernel writes directly into a freshly
-  allocated, uninitialised Python `bytes` that only the pending map
-  references. A full read returns that object to the caller with no second
-  `memcpy`; a short read copies only the bytes actually read. Mutating the
-  buffer is safe because nothing has observed the object before completion.
-- Paths for `openat`/`statx`/`mkdirat` and similar are kept as owned
-  `CString`s.
+An io_uring submission may refer to memory after the submitting function
+returns. The ring therefore retains paths and buffers until their
+completions have been collected. For writes it retains the caller's
+`bytes` object. For reads it allocates a `bytes` object for the kernel to
+fill; a full read can return that object directly. A short read copies
+only the bytes received.
 
-The kernel therefore only touches memory that outlives the operation,
-whether Rust-owned or a reference-pinned Python `bytes`.
+When a task awaiting an operation is cancelled, the driver requests
+cancellation from the kernel and still collects the operation's eventual
+completion. A successful open whose caller is gone is closed by the
+driver. A fixed-file slot is made available again only after its close
+completes.
 
-Two further read-path details. Reads of **1 MB or more** are submitted with
-`IOSQE_ASYNC`, handing them to kernel io-wq workers, so warm page-cache
-copies run on multiple cores instead of serialising inline on the loop
-thread (the same parallelism a thread pool gets, without the threads). When
-an awaiting task is **cancelled**, the driver submits `ASYNC_CANCEL` for the
-in-flight operation so its ring slot frees promptly rather than whenever the
-I/O would have finished.
+Large reads (at least 1 MiB) are submitted with `IOSQE_ASYNC`. This
+allows the kernel to carry out their page-cache copies in io-wq workers
+instead of on the event-loop thread. The [benchmarks](benchmarks.md)
+show how this affects warm reads.
 
-## Linked open-then-I/O chains
+## Whole-file operations
 
-The whole-file helpers (`Path.read_bytes`, `write_bytes`, `read_text`,
-`write_text`) go one step beyond batching: the ring registers a sparse
-**fixed-file table** at creation, and the helper submits `OPENAT` (directly
-into a table slot) linked with `IOSQE_IO_LINK` to the first `READ`/`WRITE`
-on that slot, so *open + I/O* reach the kernel as **one submission** and
-complete in one wakeup instead of three round-trips. The close is folded
-into completion handling (fire-and-forget for reads; awaited for writes so
-close errors surface), and the slot returns to the pool only after its close
-completes. If the table is exhausted or the kernel lacks sparse
-registration, the helpers fall back to the ordinary open/read/close path.
+On the io_uring backend, `Path.read_bytes()` and `Path.write_bytes()`
+can submit an open linked to the first read or write using a fixed-file
+slot. If the table has no free slot, or the kernel cannot register it,
+the operation uses an ordinary open/read-or-write/close sequence.
+The text helpers encode or decode around the same binary operation.
 
-## Positional I/O and the file objects
+## File positions
 
-io_uring reads and writes are *positional* (offset-based). The file objects
-track a logical offset themselves and add a small read-ahead buffer, which
-provides ordinary `read`/`readline` semantics on top of positioned I/O. A
-short read on a regular file is treated as EOF, avoiding a redundant system
-call to confirm it.
+io_uring reads and writes use explicit offsets. A urio file object keeps
+its own position and a read-ahead buffer for line reading. A short,
+nonempty read is not assumed to be end of file; the file object reads
+again if more bytes were requested. An empty read marks end of file.
 
-## Windows and the fallback
+Text files add an incremental codec and newline translation. Their
+`tell()` value is exact at an unbuffered boundary, but can be
+approximate while decoded text remains buffered.
 
-If a ring cannot be created (non-Linux, an old kernel, or an environment
-that blocks the system calls), urio uses the
-[thread-pool backend](getting-started/backends.md) instead, the same
-approach aiofiles takes. Detection happens once, by attempting to create a
-ring, so callers never branch on platform.
+## Windows and the thread backend
 
-Windows has its own native path: the opt-in
-[IOCP backend](getting-started/backends.md#iocp-io-completion-ports-windows-opt-in)
-mirrors the Linux design with overlapped I/O and an I/O completion port,
-reaping completions on the event-loop thread through the port that asyncio's
-`ProactorEventLoop` already owns, the Windows analogue of the eventfd
-bridge. It is enabled with `URIO_WINDOWS_IOCP=1`; otherwise Windows uses the
-thread backend.
+With `URIO_WINDOWS_IOCP=1`, file opens, reads, writes, and closes use
+Windows overlapped I/O. On a ProactorEventLoop, completions are collected
+through the loop's own completion port. Other loop types use a poller
+thread that delivers batches to the loop. Other filesystem operations
+use the executor.
 
-## Scope of io_uring opcodes
-
-The `uring` backend submits: read, write, writev, fsync/fdatasync, openat,
-close, statx, mkdirat, unlinkat, renameat, symlinkat, linkat, async-cancel,
-and ftruncate (an opcode since kernel 6.9; on older kernels the completion
-reports it unsupported and urio routes that call to the executor for the
-rest of the process). Operations without an in-scope opcode (directory
-listing, `chmod`, `readlink`, `realpath`, `utime`) run on the thread-pool
-path even under the `uring` backend.
+The thread backend runs blocking file operations in the event loop's
+default executor. It also waits for cancelled executor jobs that still
+use a file before closing it. This prevents a later open from reusing
+the descriptor while an earlier job is still running.

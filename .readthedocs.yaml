@@ -1,6 +1,3 @@
-# Read the Docs build configuration.
-# The docs are pure MkDocs (handwritten API pages), so the native extension is
-# not built here — only mkdocs-material is installed.
 version: 2
 
 build:

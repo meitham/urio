@@ -5,41 +5,45 @@ on:
     branches: [main]
   pull_request:
 
+permissions:
+  contents: read
+
 jobs:
   lint:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: '3.12'
+      - uses: dtolnay/rust-toolchain@stable
       - run: pip install ruff
       - name: Lint
         run: |
           ruff check .
           ruff format --check .
+          cargo fmt --check
 
   test:
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        python: ['3.12', '3.13', '3.14']
+        python: ['3.12', '3.13', '3.14', '3.15']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
           python-version: ${{ matrix.python }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Install
-        # maturin develop needs a virtualenv, which setup-python is not —
-        # build a wheel and pip-install it instead.
         run: |
           python -m pip install --upgrade pip
-          pip install maturin pytest pytest-asyncio aiofiles
+          pip install 'maturin>=1.15,<2' pytest pytest-asyncio aiofiles
           maturin build --release --out dist
+          python scripts/check_wheels.py dist
           pip install --no-index --find-links dist urio
       - name: Test
         run: pytest -q
@@ -47,9 +51,6 @@ jobs:
         if: runner.os == 'Windows'
         env:
           URIO_WINDOWS_IOCP: '1'
-        # faulthandler_timeout dumps every thread's stack if a test wedges,
-        # so a hang names its culprit instead of silently hitting the job
-        # timeout.
         run: pytest -q -o faulthandler_timeout=120
 
   test-free-threaded:
@@ -57,21 +58,21 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
+        python: ['3.14t', '3.15t']
     runs-on: ${{ matrix.os }}
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
         with:
-          python-version: '3.14t'
+          python-version: ${{ matrix.python }}
       - uses: dtolnay/rust-toolchain@stable
       - name: Install
-        # -i python: target the running free-threaded interpreter, producing a
-        # cp314t wheel — free-threaded builds cannot load abi3 wheels.
         run: |
           python -m pip install --upgrade pip
-          pip install maturin pytest pytest-asyncio aiofiles
+          pip install 'maturin>=1.15,<2' pytest pytest-asyncio aiofiles
           maturin build --release --out dist -i python
+          python scripts/check_wheels.py dist
           pip install --no-index --find-links dist urio
       - name: Test
         run: pytest -q
@@ -79,7 +80,4 @@ jobs:
         if: runner.os == 'Windows'
         env:
           URIO_WINDOWS_IOCP: '1'
-        # faulthandler_timeout dumps every thread's stack if a test wedges,
-        # so a hang names its culprit instead of silently hitting the job
-        # timeout.
         run: pytest -q -o faulthandler_timeout=120

@@ -1,70 +1,47 @@
 # Installation
 
-## From PyPI
+Install urio with pip:
 
-```bash
-pip install urio
+```console
+python -m pip install urio
 ```
 
-Prebuilt wheels target Python 3.12+ via the stable ABI (`abi3`), so a single
-wheel works across CPython versions.
+urio requires CPython 3.12 or newer. Regular CPython 3.12–3.15 uses wheels
+built against Python's stable ABI. Free-threaded Python requires a separate
+wheel for each interpreter version. The 0.2.0 release provides 3.14t
+wheels. The current source builds on 3.15t, but a 3.15t wheel is not yet
+published. Build from a checkout with Rust and maturin until one is available.
 
-## Requirements
+On Linux, urio uses io_uring if the kernel supports the required operations
+and permits a ring to be created. Linux 5.6 or newer is recommended. On
+macOS, Windows, older Linux kernels, and restricted Linux environments, urio
+uses a thread pool. The [Windows IOCP backend](backends.md) is available by
+opt-in.
 
-- **Python** 3.12 or newer, on any operating system.
-- **Linux 5.6+** for the io_uring backend.
-- **Windows 10/11** for the [IOCP backend](backends.md) — opt-in via
-  `URIO_WINDOWS_IOCP=1`; Windows otherwise uses the thread backend.
+The project builds wheels for Linux (x86_64, aarch64, armv7), Windows
+(x64, x86), and macOS (x86_64, arm64). If pip builds from source, a Rust
+toolchain is required.
 
-Everywhere else (macOS, older kernels, environments where the io_uring system
-calls are blocked) urio automatically uses its
-[thread-pool backend](backends.md), the same approach aiofiles takes, so the
-library works on any platform.
-
-urio detects io_uring availability at runtime by creating a ring, so callers
-never need to branch on platform.
-
-## Platforms & wheels
-
-Prebuilt `abi3` wheels (one per platform, covering CPython 3.12+) are published
-for:
-
-| Platform | Architectures | Backend |
-|---|---|---|
-| Linux (manylinux & musllinux) | x86_64, aarch64, armv7 | io_uring |
-| Windows | x64, x86 | thread pool by default; [IOCP](backends.md) opt-in |
-| macOS | x86_64, arm64 | thread pool |
-
-The native extension carries the io_uring ring on Linux and the IOCP driver on
-Windows; on macOS it compiles to an empty stub and urio runs on the thread
-backend. In every case the wheel installs without a Rust toolchain.
-
-## Building from source
-
-Building the native extension needs a Rust toolchain and
-[maturin](https://www.maturin.rs/):
-
-```bash
-git clone https://github.com/meitham/urio
-cd urio
-pip install -e ".[dev]"      # installs maturin, pytest, aiofiles, ruff
-maturin develop --release    # compile the Rust extension into your venv
-```
-
-After any change to the Rust sources (`src/lib.rs`) re-run `maturin develop`
-before the Python side sees it.
-
-## Verifying the install
+## Check the installation
 
 ```python
-import asyncio
 import urio
 
-
-async def main():
-    print('urio', urio.__version__)
-    print('backend:', urio.get_backend().name)  # 'uring', 'iocp', or 'thread'
-
-
-asyncio.run(main())
+print(urio.__version__)
+print(urio.get_backend().name)
 ```
+
+The backend name is `uring`, `iocp`, or `thread`.
+Backend selection happens at runtime. An installed Linux wheel can therefore
+use the thread backend if io_uring is unavailable.
+
+## Install from a checkout
+
+```console
+git clone https://github.com/meitham/urio
+cd urio
+python -m pip install -e '.[dev]'
+```
+
+The editable install builds the Rust extension with maturin. Reinstall after
+changing Rust code. For release builds, use `maturin build --release`.

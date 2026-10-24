@@ -10,7 +10,6 @@
 //! paths, and — for writes — the caller's Python `bytes` object itself (held by
 //! reference), so the kernel writes from that buffer with no per-write copy.
 
-// Needed to define the extension module on every platform.
 use pyo3::prelude::*;
 
 #[cfg(target_os = "linux")]
@@ -32,29 +31,28 @@ use pyo3::types::{PyBytes, PyTuple};
 /// Owned state that must stay alive until a submission completes.
 #[cfg(target_os = "linux")]
 enum Pending {
-    // Reads are zero-(extra-)copy: the kernel writes directly into a
-    // preallocated, uninitialised Python `bytes` object that only `pending`
-    // references. A full read hands that very object back to Python (no
-    // memcpy); only a short read pays a copy of the prefix. Mutating the
-    // buffer is safe because nothing has observed the object yet — the same
-    // reasoning as PyBytes_FromStringAndSize(NULL, n) + fill inside CPython.
-    Read { buf: Py<PyBytes>, cap: usize },
-    // Buffers/paths are kept solely so the kernel can read from / write into
-    // them while the operation is in flight. For writes we keep the Python
-    // `bytes` object itself alive (rather than copying it into a Vec): `bytes`
-    // is immutable and CPython never relocates it, and holding this reference in
-    // `pending` prevents Python from freeing it — so the kernel can read from
-    // the object's own buffer with no per-write copy.
-    Write { _buf: Py<PyBytes> },
-    // Vectored write: the caller's `bytes` objects plus the iovec array the
-    // kernel walks — both must outlive the submission.
+    Read {
+        buf: Py<PyBytes>,
+        cap: usize,
+    },
+    Write {
+        _buf: Py<PyBytes>,
+    },
     Writev {
         _bufs: Vec<Py<PyBytes>>,
         _iov: IovBox,
     },
-    Statx { _path: CString, stx: Box<statx_abi::statx> },
-    Open { _path: CString },
-    Paths { _paths: Vec<CString> },
+    Statx {
+        _path: CString,
+        stx: Box<statx_abi::statx>,
+    },
+    Open {
+        _path: CString,
+        direct: bool,
+    },
+    Paths {
+        _paths: Vec<CString>,
+    },
     Plain,
 }
 
@@ -94,7 +92,6 @@ mod statx_abi {
         pub __reserved: i32,
     }
 
-    // include/uapi/linux/stat.h `struct statx` — 256 bytes.
     #[repr(C)]
     pub struct statx {
         pub stx_mask: u32,
@@ -136,13 +133,6 @@ const ASYNC_READ_MIN: usize = 1 << 20;
 #[cfg(target_os = "linux")]
 const FIXED_SLOTS: u32 = 512;
 
-// Deliberately NOT `unsendable`: the driver confines each ring to its loop
-// thread, but the *last reference* can be dropped by GC on any thread — e.g.
-// an event loop from `asyncio.run` in a worker thread collected later on the
-// main thread. An unsendable class turns that drop into an unraisable
-// RuntimeError and leaks the ring. Every field is Send + Sync (see `IovBox`),
-// and both `io_uring_enter` and the fd closes in `Drop` are thread-agnostic,
-// so a cross-thread drop is sound.
 #[cfg(target_os = "linux")]
 #[pyclass]
 struct Ring {
@@ -176,10 +166,8 @@ fn os_ioerr(e: io::Error) -> PyErr {
 #[cfg(target_os = "linux")]
 fn alloc_pybytes(py: Python<'_>, len: usize) -> PyResult<(Py<PyBytes>, *mut u8)> {
     unsafe {
-        let raw = pyo3::ffi::PyBytes_FromStringAndSize(
-            std::ptr::null(),
-            len as pyo3::ffi::Py_ssize_t,
-        );
+        let raw =
+            pyo3::ffi::PyBytes_FromStringAndSize(std::ptr::null(), len as pyo3::ffi::Py_ssize_t);
         if raw.is_null() {
             return Err(PyErr::fetch(py));
         }
@@ -196,8 +184,6 @@ impl Ring {
     /// `submit()` (one `io_uring_enter`) per event-loop tick. Only if the
     /// submission queue is momentarily full do we flush early to make room.
     fn push_entry(&mut self, entry: &io_uring::squeue::Entry) -> io::Result<()> {
-        // SAFETY: the buffers referenced by `entry` are stored in `pending`
-        // before this call and live until the matching completion is reaped.
         let first = unsafe { self.ring.submission().push(entry) };
         if first.is_err() {
             self.ring.submit()?;
@@ -222,8 +208,6 @@ impl Ring {
         if need_flush {
             self.ring.submit()?;
         }
-        // SAFETY: as in push_entry — everything the entries reference lives in
-        // `pending` until the completions are reaped.
         unsafe {
             let mut sq = self.ring.submission();
             sq.push(first)
@@ -262,13 +246,7 @@ impl Ring {
     #[new]
     #[pyo3(signature = (entries = 256))]
     fn new(entries: u32) -> PyResult<Self> {
-        // Keep the default builder. Cross-thread drop (see `Drop`) relies on
-        // the ring being usable from whatever thread GC runs on; opting into
-        // IORING_SETUP_SINGLE_ISSUER or SQPOLL would silently break that
-        // (enter/reap become issuer-thread-only) — revisit `Drop` first.
         let ring = IoUring::new(entries).map_err(os_ioerr)?;
-        // EFD_NONBLOCK so draining never blocks the loop thread; CLOEXEC so the
-        // fd does not leak across exec.
         let efd = unsafe { libc::eventfd(0, libc::EFD_NONBLOCK | libc::EFD_CLOEXEC) };
         if efd < 0 {
             return Err(os_ioerr(io::Error::last_os_error()));
@@ -277,9 +255,6 @@ impl Ring {
             unsafe { libc::close(efd) };
             os_ioerr(e)
         })?;
-        // A sparse direct-descriptor table enables linked open→I/O chains
-        // (one submission for open+read / open+write). Optional: on kernels
-        // without sparse registration the chains are simply not offered.
         let fixed_slots = match ring.submitter().register_files_sparse(FIXED_SLOTS) {
             Ok(()) => FIXED_SLOTS,
             Err(_) => 0,
@@ -324,9 +299,7 @@ impl Ring {
     fn drain_eventfd(&self) {
         let mut buf = [0u8; 8];
         loop {
-            let n = unsafe {
-                libc::read(self.eventfd, buf.as_mut_ptr() as *mut libc::c_void, 8)
-            };
+            let n = unsafe { libc::read(self.eventfd, buf.as_mut_ptr() as *mut libc::c_void, 8) };
             if n != 8 {
                 break;
             }
@@ -335,45 +308,36 @@ impl Ring {
 
     fn submit_read(&mut self, py: Python<'_>, fd: RawFd, offset: u64, len: u32) -> PyResult<u64> {
         let id = self.alloc_id();
-        // Zero-copy: the kernel writes directly into a fresh uninitialised
-        // `bytes` object. A full read hands the object to Python as-is (the
-        // old Vec path paid a second full memcpy in `reap`); only a short read
-        // copies, and then only the bytes actually read. No zero-fill either —
-        // the kernel overwrites the buffer and the uninitialised tail of a
-        // short read is never exposed.
         let (buf, ptr) = alloc_pybytes(py, len as usize)?;
-        self.pending.insert(id, Pending::Read { buf, cap: len as usize });
+        self.pending.insert(
+            id,
+            Pending::Read {
+                buf,
+                cap: len as usize,
+            },
+        );
         let mut entry = opcode::Read::new(types::Fd(fd), ptr, len)
             .offset(offset)
             .build()
             .user_data(id);
-        // Large warm reads complete inline at submit time, serialising every
-        // page-cache memcpy on the loop thread. IOSQE_ASYNC punts them to
-        // io-wq workers so concurrent big reads copy on multiple cores (the
-        // same parallelism a thread pool gets). Small reads stay inline —
-        // the punt costs more than the copy there.
         if len as usize >= ASYNC_READ_MIN {
             entry = entry.flags(squeue::Flags::ASYNC);
         }
         self.finish(id, entry)
     }
 
-    fn submit_write(
-        &mut self,
-        fd: RawFd,
-        offset: u64,
-        data: Bound<'_, PyBytes>,
-    ) -> PyResult<u64> {
+    fn submit_write(&mut self, fd: RawFd, offset: u64, data: Bound<'_, PyBytes>) -> PyResult<u64> {
         let id = self.alloc_id();
-        // Zero-copy: point the kernel at the Python bytes' own buffer and keep
-        // the object alive in `pending` until the write completes. No to_vec().
-        // The raw pointer stays valid because `bytes` is immutable, never
-        // relocated by CPython, and the stored reference prevents its free.
         let (ptr, len) = {
             let b = data.as_bytes();
             (b.as_ptr(), b.len() as u32)
         };
-        self.pending.insert(id, Pending::Write { _buf: data.unbind() });
+        self.pending.insert(
+            id,
+            Pending::Write {
+                _buf: data.unbind(),
+            },
+        );
         let entry = opcode::Write::new(types::Fd(fd), ptr, len)
             .offset(offset)
             .build()
@@ -457,7 +421,13 @@ impl Ring {
         let id = self.alloc_id();
         let cpath = cstring(path)?;
         let ptr = cpath.as_ptr();
-        self.pending.insert(id, Pending::Open { _path: cpath });
+        self.pending.insert(
+            id,
+            Pending::Open {
+                _path: cpath,
+                direct: false,
+            },
+        );
         let entry = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), ptr)
             .flags(flags)
             .mode(mode)
@@ -472,14 +442,6 @@ impl Ring {
         let entry = opcode::Close::new(types::Fd(fd)).build().user_data(id);
         self.finish(id, entry)
     }
-
-    // -- linked open→I/O chains on direct descriptors ----------------------
-    //
-    // One submission opens the path straight into fixed-file slot `slot` and
-    // (IO_LINK) performs the first I/O on it — a whole small-file read or
-    // write costs a single submit/wakeup round-trip instead of three. The
-    // Python driver owns slot allocation and closes the slot afterwards. If
-    // the open fails, the linked op completes with -ECANCELED.
 
     /// Open `path` into `slot` and read `len` bytes from offset 0, linked.
     /// Returns `(open_id, read_id)`.
@@ -510,9 +472,20 @@ impl Ring {
             .offset(0)
             .build()
             .user_data(read_id);
-        self.pending.insert(open_id, Pending::Open { _path: cpath });
-        self.pending
-            .insert(read_id, Pending::Read { buf, cap: len as usize });
+        self.pending.insert(
+            open_id,
+            Pending::Open {
+                _path: cpath,
+                direct: true,
+            },
+        );
+        self.pending.insert(
+            read_id,
+            Pending::Read {
+                buf,
+                cap: len as usize,
+            },
+        );
         if let Err(e) = self.push_pair(&open_entry, &read_entry) {
             self.pending.remove(&open_id);
             self.pending.remove(&read_id);
@@ -552,9 +525,19 @@ impl Ring {
             .offset(0)
             .build()
             .user_data(write_id);
-        self.pending.insert(open_id, Pending::Open { _path: cpath });
-        self.pending
-            .insert(write_id, Pending::Write { _buf: data.unbind() });
+        self.pending.insert(
+            open_id,
+            Pending::Open {
+                _path: cpath,
+                direct: true,
+            },
+        );
+        self.pending.insert(
+            write_id,
+            Pending::Write {
+                _buf: data.unbind(),
+            },
+        );
         if let Err(e) = self.push_pair(&open_entry, &write_entry) {
             self.pending.remove(&open_id);
             self.pending.remove(&write_id);
@@ -574,12 +557,17 @@ impl Ring {
     ) -> PyResult<u64> {
         let id = self.alloc_id();
         let (buf, ptr) = alloc_pybytes(py, len as usize)?;
-        self.pending.insert(id, Pending::Read { buf, cap: len as usize });
+        self.pending.insert(
+            id,
+            Pending::Read {
+                buf,
+                cap: len as usize,
+            },
+        );
         let mut entry = opcode::Read::new(types::Fixed(slot), ptr, len)
             .offset(offset)
             .build()
             .user_data(id);
-        // Same io-wq punt as submit_read: parallelise big warm-read copies.
         if len as usize >= ASYNC_READ_MIN {
             entry = entry.flags(squeue::Flags::ASYNC);
         }
@@ -599,7 +587,12 @@ impl Ring {
             let b = data.as_bytes();
             (b.as_ptr(), b.len() as u32)
         };
-        self.pending.insert(id, Pending::Write { _buf: data.unbind() });
+        self.pending.insert(
+            id,
+            Pending::Write {
+                _buf: data.unbind(),
+            },
+        );
         let entry = opcode::Write::new(types::Fixed(slot), ptr, len)
             .offset(offset)
             .build()
@@ -623,18 +616,15 @@ impl Ring {
         let path_ptr = cpath.as_ptr();
         let stx: Box<statx_abi::statx> = Box::new(unsafe { std::mem::zeroed() });
         let stx_ptr = Box::as_ref(&stx) as *const statx_abi::statx as *mut types::statx;
-        let mut flags = if follow {
-            0
-        } else {
-            libc::AT_SYMLINK_NOFOLLOW
-        };
+        let mut flags = if follow { 0 } else { libc::AT_SYMLINK_NOFOLLOW };
         flags |= statx_abi::AT_STATX_SYNC_AS_STAT;
         let entry = opcode::Statx::new(types::Fd(libc::AT_FDCWD), path_ptr, stx_ptr)
             .flags(flags)
             .mask(statx_abi::STATX_BASIC_STATS)
             .build()
             .user_data(id);
-        self.pending.insert(id, Pending::Statx { _path: cpath, stx });
+        self.pending
+            .insert(id, Pending::Statx { _path: cpath, stx });
         self.finish(id, entry)
     }
 
@@ -652,7 +642,8 @@ impl Ring {
             .mask(statx_abi::STATX_BASIC_STATS)
             .build()
             .user_data(id);
-        self.pending.insert(id, Pending::Statx { _path: empty, stx });
+        self.pending
+            .insert(id, Pending::Statx { _path: empty, stx });
         self.finish(id, entry)
     }
 
@@ -661,7 +652,12 @@ impl Ring {
         let id = self.alloc_id();
         let cpath = cstring(path)?;
         let ptr = cpath.as_ptr();
-        self.pending.insert(id, Pending::Paths { _paths: vec![cpath] });
+        self.pending.insert(
+            id,
+            Pending::Paths {
+                _paths: vec![cpath],
+            },
+        );
         let entry = opcode::MkDirAt::new(types::Fd(libc::AT_FDCWD), ptr)
             .mode(mode)
             .build()
@@ -676,7 +672,12 @@ impl Ring {
         let cpath = cstring(path)?;
         let ptr = cpath.as_ptr();
         let flags = if remove_dir { libc::AT_REMOVEDIR } else { 0 };
-        self.pending.insert(id, Pending::Paths { _paths: vec![cpath] });
+        self.pending.insert(
+            id,
+            Pending::Paths {
+                _paths: vec![cpath],
+            },
+        );
         let entry = opcode::UnlinkAt::new(types::Fd(libc::AT_FDCWD), ptr)
             .flags(flags)
             .build()
@@ -690,8 +691,12 @@ impl Ring {
         let cdst = cstring(dst)?;
         let sptr = csrc.as_ptr();
         let dptr = cdst.as_ptr();
-        self.pending
-            .insert(id, Pending::Paths { _paths: vec![csrc, cdst] });
+        self.pending.insert(
+            id,
+            Pending::Paths {
+                _paths: vec![csrc, cdst],
+            },
+        );
         let entry = opcode::RenameAt::new(
             types::Fd(libc::AT_FDCWD),
             sptr,
@@ -709,8 +714,12 @@ impl Ring {
         let clink = cstring(linkpath)?;
         let tptr = ctarget.as_ptr();
         let lptr = clink.as_ptr();
-        self.pending
-            .insert(id, Pending::Paths { _paths: vec![ctarget, clink] });
+        self.pending.insert(
+            id,
+            Pending::Paths {
+                _paths: vec![ctarget, clink],
+            },
+        );
         let entry = opcode::SymlinkAt::new(types::Fd(libc::AT_FDCWD), tptr, lptr)
             .build()
             .user_data(id);
@@ -723,8 +732,12 @@ impl Ring {
         let cdst = cstring(dst)?;
         let sptr = csrc.as_ptr();
         let dptr = cdst.as_ptr();
-        self.pending
-            .insert(id, Pending::Paths { _paths: vec![csrc, cdst] });
+        self.pending.insert(
+            id,
+            Pending::Paths {
+                _paths: vec![csrc, cdst],
+            },
+        );
         let entry = opcode::LinkAt::new(
             types::Fd(libc::AT_FDCWD),
             sptr,
@@ -759,15 +772,10 @@ impl Ring {
                     Some(Pending::Read { buf, cap }) => {
                         let n = res as usize;
                         if n == cap {
-                            // Full read: hand Python the very buffer the kernel
-                            // filled — no copy. Safe: `pending` held the only
-                            // reference, so nothing observed it uninitialised.
                             buf.into_any()
                         } else {
-                            // Short read: expose only the bytes actually read.
-                            let p = unsafe {
-                                pyo3::ffi::PyBytes_AsString(buf.as_ptr()) as *const u8
-                            };
+                            let p =
+                                unsafe { pyo3::ffi::PyBytes_AsString(buf.as_ptr()) as *const u8 };
                             let s = unsafe { std::slice::from_raw_parts(p, n) };
                             PyBytes::new(py, s).into()
                         }
@@ -793,31 +801,11 @@ const IORING_ENTER_GETEVENTS: u32 = 1;
 #[cfg(target_os = "linux")]
 const DRAIN_POLL_MS: i32 = 100;
 #[cfg(target_os = "linux")]
-const DRAIN_MAX_SILENT_POLLS: u32 = 50; // ~5 s without a single completion
+const DRAIN_MAX_SILENT_POLLS: u32 = 50;
 
 #[cfg(target_os = "linux")]
 impl Drop for Ring {
     fn drop(&mut self) {
-        // The kernel may still be reading from / writing into buffers held in
-        // `pending`. Dropping the ring would free those buffers (and unmap the
-        // rings) out from under in-flight operations — a use-after-free. Wait
-        // for the outstanding completions before letting the buffers drop.
-        //
-        // Two things this drain must never do:
-        //
-        //  * Submit. SQEs still sitting in the SQ ring were never consumed by
-        //    the kernel — their `io_uring_enter` failed and the driver already
-        //    failed their futures — so entering with `to_submit > 0` here
-        //    would execute ops the application was told had failed, e.g.
-        //    writing a stale payload into an fd number the application closed
-        //    and the OS has since recycled. They die with the ring instead,
-        //    and their buffers are safe to free: the kernel never saw them.
-        //
-        //  * Wait forever. An op stuck on a hung mount (NFS, 9p) would
-        //    otherwise block whichever thread runs GC — possibly the main
-        //    thread at interpreter exit. After ~5 s with no completion at all
-        //    the remaining buffers are deliberately leaked: the kernel may
-        //    still write into them, so leaking is the only safe way out.
         let queued = {
             let mut sq = self.ring.submission();
             sq.sync();
@@ -826,10 +814,6 @@ impl Drop for Ring {
         let mut remaining = self.pending.len().saturating_sub(queued);
         let mut silent_polls = 0u32;
         while remaining > 0 {
-            // GETEVENTS with to_submit == 0 and min_complete == 0: flush any
-            // overflowed CQEs into the ring without submitting or blocking.
-            // Best-effort — if it fails, the poll below still sees ordinary
-            // completions and the silence cap bounds the wait.
             let _ = unsafe {
                 self.ring
                     .submitter()
@@ -839,7 +823,14 @@ impl Drop for Ring {
             {
                 let mut cq = self.ring.completion();
                 cq.sync();
-                for _ in &mut cq {
+                for cqe in &mut cq {
+                    if let Some(Pending::Open { direct: false, .. }) =
+                        self.pending.remove(&cqe.user_data())
+                    {
+                        if cqe.result() >= 0 {
+                            unsafe { libc::close(cqe.result()) };
+                        }
+                    }
                     completed += 1;
                 }
             }
@@ -852,7 +843,6 @@ impl Drop for Ring {
                 std::mem::forget(std::mem::take(&mut self.pending));
                 break;
             }
-            // The ring fd polls readable when the CQ is non-empty.
             let mut pfd = libc::pollfd {
                 fd: self.ring.as_raw_fd(),
                 events: libc::POLLIN,
@@ -862,7 +852,6 @@ impl Drop for Ring {
             if rc == 0 {
                 silent_polls += 1;
             } else if rc < 0 && io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
-                // Cannot even wait any more; leaking beats a use-after-free.
                 std::mem::forget(std::mem::take(&mut self.pending));
                 break;
             }
@@ -881,42 +870,24 @@ fn ts_ns(t: &statx_abi::statx_timestamp) -> i64 {
 fn statx_tuple(py: Python<'_>, s: &statx_abi::statx) -> PyResult<Py<PyAny>> {
     let dev = libc::makedev(s.stx_dev_major, s.stx_dev_minor);
     let rdev = libc::makedev(s.stx_rdev_major, s.stx_rdev_minor);
-    // 13 fields exceeds PyO3's tuple-conversion arity, and the values are mixed
-    // signedness, so widen everything to i128 and build the tuple explicitly.
     let elems: [i128; 13] = [
-        s.stx_mode as i128,          // 0 mode
-        s.stx_ino as i128,           // 1 inode
-        dev as i128,                 // 2 device
-        s.stx_nlink as i128,         // 3 nlink
-        s.stx_uid as i128,           // 4 uid
-        s.stx_gid as i128,           // 5 gid
-        s.stx_size as i128,          // 6 size
-        ts_ns(&s.stx_atime) as i128, // 7 atime ns
-        ts_ns(&s.stx_mtime) as i128, // 8 mtime ns
-        ts_ns(&s.stx_ctime) as i128, // 9 ctime ns
-        s.stx_blksize as i128,       // 10 blksize
-        s.stx_blocks as i128,        // 11 blocks (512B units)
-        rdev as i128,                // 12 rdev
+        s.stx_mode as i128,
+        s.stx_ino as i128,
+        dev as i128,
+        s.stx_nlink as i128,
+        s.stx_uid as i128,
+        s.stx_gid as i128,
+        s.stx_size as i128,
+        ts_ns(&s.stx_atime) as i128,
+        ts_ns(&s.stx_mtime) as i128,
+        ts_ns(&s.stx_ctime) as i128,
+        s.stx_blksize as i128,
+        s.stx_blocks as i128,
+        rdev as i128,
     ];
     Ok(PyTuple::new(py, elems)?.into_any().unbind())
 }
 
-// ===========================================================================
-// Windows: real async file I/O via overlapped I/O + I/O completion ports.
-//
-// Production-validated on Windows 10/11 (CPython 3.14, GIL and free-threaded).
-// Disabled unless URIO_WINDOWS_IOCP=1; Windows otherwise uses the thread-pool
-// backend (reads are the trade-off — see docs/benchmarks.md). Mirrors
-// the Linux design: each op carries owned buffers that outlive the kernel
-// operation. Two reaping strategies:
-//   * `ProactorIo` (primary): submit overlapped ops onto asyncio's
-//     ProactorEventLoop IOCP and let the loop reap them on the loop thread — no
-//     poller thread, no cross-thread hop, the Windows analogue of Linux eventfd.
-//   * `Iocp` (fallback for non-Proactor loops): a single poller thread reaps
-//     completions in batches and hands each batch to the loop with one
-//     `call_soon_threadsafe` (one thread for any number of in-flight ops).
-// See driver_iocp_proactor.py and driver_iocp.py.
-// ===========================================================================
 #[cfg(windows)]
 mod iocp {
     use std::cell::RefCell;
@@ -937,18 +908,13 @@ mod iocp {
         OVERLAPPED, OVERLAPPED_ENTRY,
     };
 
-    // NTSTATUS reported in OVERLAPPED.Internal for a read that hit end-of-file.
     const STATUS_END_OF_FILE: u32 = 0xC000_0011;
-    // Reap up to this many completions per GetQueuedCompletionStatusEx call so a
-    // single cross-thread wakeup + GIL acquire serves a whole burst of ops.
     const BATCH: usize = 64;
 
-    // ntdll is always loaded; map an I/O NTSTATUS to a Win32 error for reporting.
     extern "system" {
         fn RtlNtStatusToDosError(status: i32) -> u32;
     }
 
-    // Win32 constants (declared locally to avoid version-specific import paths).
     const GENERIC_READ: u32 = 0x8000_0000;
     const GENERIC_WRITE: u32 = 0x4000_0000;
     const FILE_SHARE_READ: u32 = 0x1;
@@ -975,20 +941,12 @@ mod iocp {
         ov: OVERLAPPED,
         id: u64,
         kind: u8,
-        // Reads: the kernel writes directly into this preallocated Python
-        // `bytes` (only `pending`/the Op reference it, so nothing observes it
-        // uninitialised). A full read hands the object back with no copy —
-        // the memcpy that used to dominate large warm reads; a short read
-        // copies just the prefix. `rptr`/`rcap` cache its buffer and size.
         rbuf: Option<Py<PyBytes>>,
         rptr: *mut u8,
         rcap: usize,
-        // Writes only: the caller's `bytes`, held alive until the completion is
-        // reaped so the pointer handed to WriteFile stays valid (bytes are
-        // immutable and never relocated by CPython).
         wbuf: Option<Py<PyBytes>>,
-        handle: isize, // open: resulting handle
-        status: i32,   // non-zero = synthetic error (open/close/sync failure)
+        handle: isize,
+        status: i32,
     }
 
     /// Allocate an uninitialised Python `bytes` of exactly `len` bytes (the
@@ -1080,9 +1038,8 @@ mod iocp {
     impl Iocp {
         #[new]
         fn new(loop_obj: Py<PyAny>, on_complete: Py<PyAny>) -> PyResult<Self> {
-            let port = unsafe {
-                CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0)
-            };
+            let port =
+                unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
             if port.is_null() {
                 return Err(pyo3::exceptions::PyOSError::new_err(
                     "CreateIoCompletionPort failed",
@@ -1113,7 +1070,7 @@ mod iocp {
                 GENERIC_READ
             };
             let disp = if create && exclusive {
-                CREATE_NEW // O_CREAT|O_EXCL: fail (ERROR_FILE_EXISTS) if it exists
+                CREATE_NEW
             } else if truncate {
                 CREATE_ALWAYS
             } else if create {
@@ -1135,11 +1092,15 @@ mod iocp {
             let status = if handle == INVALID_HANDLE_VALUE {
                 unsafe { GetLastError() as i32 }
             } else {
-                // Associate the new handle with our completion port.
-                unsafe {
-                    CreateIoCompletionPort(handle, self.port as *mut c_void, 0, 0);
+                let port =
+                    unsafe { CreateIoCompletionPort(handle, self.port as *mut c_void, 0, 0) };
+                if port.is_null() {
+                    let error = unsafe { GetLastError() as i32 };
+                    unsafe { CloseHandle(handle) };
+                    error
+                } else {
+                    0
                 }
-                0
             };
             let op = Box::new(Op {
                 ov: unsafe { std::mem::zeroed() },
@@ -1164,9 +1125,6 @@ mod iocp {
             len: u32,
         ) -> PyResult<u64> {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            // Zero-copy: the kernel writes straight into a preallocated bytes
-            // object (no zero-fill — the uninitialised tail of a short read is
-            // never exposed; see Op.rbuf).
             let (rbuf, rptr) = alloc_pybytes(py, len as usize)?;
             let mut op = Box::new(Op {
                 ov: unsafe { std::mem::zeroed() },
@@ -1183,8 +1141,6 @@ mod iocp {
             op.ov.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
             let ptr = Box::into_raw(op);
             unsafe {
-                // lpNumberOfBytesRead is only read in the synchronous EOF branch
-                // below (valid then); the async path uses the completion's count.
                 let mut nread: u32 = 0;
                 let ok = ReadFile(
                     handle as *mut c_void,
@@ -1196,10 +1152,7 @@ mod iocp {
                 if ok == 0 {
                     let e = GetLastError();
                     if e == ERROR_IO_PENDING {
-                        // async — the kernel will post the completion.
                     } else if e == ERROR_HANDLE_EOF {
-                        // Reading at/over EOF: deliver the bytes read so far
-                        // (possibly 0) as a successful short read = EOF.
                         PostQueuedCompletionStatus(
                             self.port as *mut c_void,
                             nread,
@@ -1217,8 +1170,6 @@ mod iocp {
 
         fn submit_write(&self, handle: isize, offset: u64, data: Bound<'_, PyBytes>) -> u64 {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            // Zero-copy: point WriteFile at the Python bytes' own buffer and keep
-            // the object alive in the Op (dropped when the completion is reaped).
             let (dptr, len) = {
                 let b = data.as_bytes();
                 (b.as_ptr(), b.len() as u32)
@@ -1280,6 +1231,20 @@ mod iocp {
             id
         }
 
+        /// Release a successful open whose Python awaiter was cancelled.
+        fn close_now(&self, handle: isize) -> PyResult<()> {
+            if unsafe { CloseHandle(handle as *mut c_void) } == 0 {
+                let error = unsafe { GetLastError() };
+                return Err(pyo3::exceptions::PyOSError::new_err((
+                    0i32,
+                    format!("CloseHandle failed (winerror {error})"),
+                    Option::<String>::None,
+                    error as i32,
+                )));
+            }
+            Ok(())
+        }
+
         fn shutdown(&mut self) {
             self.stop_poller();
         }
@@ -1309,12 +1274,10 @@ mod iocp {
                     BATCH as u32,
                     &mut removed,
                     INFINITE,
-                    0, // not alertable
+                    0,
                 )
             };
             if ok == 0 {
-                // INFINITE wait on a live port does not fail; treat any failure
-                // (e.g. the port closed during shutdown) as a stop.
                 break;
             }
             let mut shutdown = false;
@@ -1322,7 +1285,6 @@ mod iocp {
                 let batch = PyList::empty(py);
                 for entry in &entries[..removed as usize] {
                     if entry.lpOverlapped.is_null() {
-                        // The shutdown sentinel is posted with a null overlapped.
                         if entry.lpCompletionKey == SHUTDOWN_KEY {
                             shutdown = true;
                         }
@@ -1331,11 +1293,8 @@ mod iocp {
                     let mut op = unsafe { Box::from_raw(entry.lpOverlapped as *mut Op) };
                     let nbytes = entry.dwNumberOfBytesTransferred;
                     let status = if op.status != 0 {
-                        // Synthetic failure recorded at submit time (open/close).
                         op.status
                     } else {
-                        // Real I/O status lives in OVERLAPPED.Internal as an
-                        // NTSTATUS. EOF on a read is a successful short read.
                         let nt = op.ov.Internal as u32;
                         if nt == 0 || nt == STATUS_END_OF_FILE {
                             0
@@ -1354,15 +1313,10 @@ mod iocp {
                         py.None()
                     };
                     let _ = batch.append((op.id, status, value, data));
-                    // op is dropped here; a fully-read buffer has already been
-                    // handed off to the batch without a copy.
                 }
                 if batch.len() > 0 {
                     let cb = loop_obj.bind(py);
-                    let _ = cb.call_method1(
-                        "call_soon_threadsafe",
-                        (on_complete.bind(py), &batch),
-                    );
+                    let _ = cb.call_method1("call_soon_threadsafe", (on_complete.bind(py), &batch));
                 }
             });
             if shutdown {
@@ -1371,29 +1325,14 @@ mod iocp {
         }
     }
 
-    // =======================================================================
-    // ProactorIo: reap completions on the *loop thread* via asyncio's own
-    // ProactorEventLoop IOCP, with no poller thread and no call_soon_threadsafe.
-    //
-    // We submit overlapped reads/writes (with offsets — which `_overlapped`
-    // cannot express) onto the loop's completion port. The loop already blocks
-    // on that port in `IocpProactor._poll`, so our completions wake it directly
-    // and it resolves the matching future on the loop thread. Each op's owned
-    // buffer lives in `pending` until the completion is reaped (take) or the op
-    // is abandoned (discard) — never freed while the kernel may still touch it.
-    // =======================================================================
     #[pyclass(unsendable)]
     pub struct ProactorIo {
-        iocp: isize, // the loop's IOCP — borrowed, never closed here
+        iocp: isize,
         next_id: AtomicU64,
         pending: RefCell<HashMap<usize, Box<Op>>>,
     }
 
     impl ProactorIo {
-        // Insert the op, then issue the overlapped call against its stable heap
-        // address. Every path posts exactly one completion to the loop's IOCP:
-        // the kernel posts for IO_PENDING and for synchronous success, and we
-        // post manually for a synchronous EOF/error (which the kernel does not).
         fn launch_read(&self, handle: isize, mut op: Box<Op>, len: u32) -> usize {
             let op_ptr = op.as_mut() as *mut Op;
             let addr = op_ptr as usize;
@@ -1410,7 +1349,6 @@ mod iocp {
                 if ok == 0 {
                     let e = GetLastError();
                     if e == ERROR_IO_PENDING {
-                        // kernel will post the completion
                     } else if e == ERROR_HANDLE_EOF {
                         PostQueuedCompletionStatus(
                             self.iocp as *mut c_void,
@@ -1432,15 +1370,7 @@ mod iocp {
             addr
         }
 
-        // `dptr` points into the op's `wbuf` (the caller's Python bytes), which
-        // is kept alive in `pending`, so the pointer stays valid for the write.
-        fn launch_write(
-            &self,
-            handle: isize,
-            mut op: Box<Op>,
-            dptr: *const u8,
-            len: u32,
-        ) -> usize {
+        fn launch_write(&self, handle: isize, mut op: Box<Op>, dptr: *const u8, len: u32) -> usize {
             let op_ptr = op.as_mut() as *mut Op;
             let addr = op_ptr as usize;
             self.pending.borrow_mut().insert(addr, op);
@@ -1497,7 +1427,7 @@ mod iocp {
                 GENERIC_READ
             };
             let disp = if create && exclusive {
-                CREATE_NEW // O_CREAT|O_EXCL: fail (ERROR_FILE_EXISTS) if it exists
+                CREATE_NEW
             } else if truncate {
                 CREATE_ALWAYS
             } else if create {
@@ -1525,8 +1455,16 @@ mod iocp {
                     e as i32,
                 )));
             }
-            unsafe {
-                CreateIoCompletionPort(handle, self.iocp as *mut c_void, 0, 0);
+            let port = unsafe { CreateIoCompletionPort(handle, self.iocp as *mut c_void, 0, 0) };
+            if port.is_null() {
+                let error = unsafe { GetLastError() };
+                unsafe { CloseHandle(handle) };
+                return Err(pyo3::exceptions::PyOSError::new_err((
+                    0i32,
+                    format!("CreateIoCompletionPort failed (winerror {error})"),
+                    Option::<String>::None,
+                    error as i32,
+                )));
             }
             Ok(handle as isize)
         }
@@ -1545,8 +1483,6 @@ mod iocp {
             len: u32,
         ) -> PyResult<usize> {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            // Zero-copy: kernel writes straight into a preallocated bytes
-            // object (see Op.rbuf); `take` hands it back without the copy.
             let (rbuf, rptr) = alloc_pybytes(py, len as usize)?;
             let mut op = Box::new(Op {
                 ov: unsafe { std::mem::zeroed() },
@@ -1566,8 +1502,6 @@ mod iocp {
 
         fn submit_write(&self, handle: isize, offset: u64, data: Bound<'_, PyBytes>) -> usize {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            // Zero-copy: hand WriteFile the Python bytes' buffer and keep the
-            // object alive in the Op (pinned in `pending` until reaped).
             let (dptr, len) = {
                 let b = data.as_bytes();
                 (b.as_ptr(), b.len() as u32)
@@ -1629,19 +1563,8 @@ mod iocp {
     }
 }
 
-// gil_used = false: the module is safe on free-threaded (no-GIL) CPython.
-// urio creates one driver per event loop, so no ring/port is ever *used* from
-// two threads. `Ring` is Send + Sync (not unsendable) purely so the loop's GC
-// finalisation can drop it from a different thread; concurrent method calls
-// would hit PyO3's runtime borrow check, not native state. The two Windows
-// classes remain `#[pyclass(unsendable)]` (their state holds a RefCell and
-// port handles reaped by a specific thread), so on Windows a driver must be
-// torn down on its own thread — `urio.aclose()` before the loop dies.
 #[pymodule(gil_used = false)]
 fn _uring(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    // The Ring class only exists on Linux; the Iocp class only on Windows.
-    // Elsewhere the module is an empty marker and urio's backend selection
-    // falls back to the thread pool.
     #[cfg(target_os = "linux")]
     m.add_class::<Ring>()?;
     #[cfg(windows)]

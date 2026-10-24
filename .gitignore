@@ -10,10 +10,10 @@ venv
 dist
 build
 .aider*
-# Local-only files, not part of the public tree.
 CLAUDE.md
 .gitea/
 /site
 /dist-cross
 /dist-*
 uv.lock
+/benchmark-results/

@@ -1,168 +1,110 @@
 #!/usr/bin/env python3
-"""Render the benchmark results as SVG bar charts (no dependencies).
-
-Run after updating the numbers below from a `bench_vs_aiofiles.py --markdown`
-run; it writes the charts referenced by the README and the docs into
-docs/assets/. SVG is used so the charts render crisply in GitHub/Gitea markdown
-and MkDocs alike, and stay readable on light and dark themes.
-"""
+"""Render the documentation charts from the historical benchmark archive."""
 
 from __future__ import annotations
 
+import argparse
+import fnmatch
+import hashlib
+import json
 import pathlib
+from zipfile import ZipFile
 
 OUT = pathlib.Path(__file__).resolve().parent.parent / 'docs' / 'assets'
 
-# (scenario label, urio[uring] ms, urio[thread] ms, aiofiles ms)
-# Warm cache, MEDIAN of 5 runs on a Linux 4-core i5-6500, kernel 7.0, ext4-on-HDD
-# box, CPython 3.14.6, urio 0.2.0; reproduce with
-# `bench_vs_aiofiles.py --markdown --json out.json`.
-READS = [
-    ('binary 4 KB', 84, 299, 285),
-    ('binary 64 KB', 25, 75, 71),
-    ('binary 1 MB', 36, 28, 29),
-    ('binary 8 MB', 52, 23, 25),
-    ('text 4 KB', 92, 309, 313),
-    ('text 64 KB', 35, 86, 91),
-    ('text 1 MB', 44, 89, 87),
-    ('text 8 MB', 78, 145, 134),
-]
-WRITES = [
-    ('binary 4 KB', 72, 286, 293),
-    ('binary 64 KB', 14, 67, 73),
-    ('binary 1 MB', 15, 26, 25),
-    ('binary 8 MB', 23, 25, 26),
-    ('text 4 KB', 83, 328, 283),
-    ('text 64 KB', 21, 68, 77),
-    ('text 1 MB', 55, 69, 34),
-    ('text 8 MB', 52, 83, 38),
-]
-FSYNC = [
-    ('binary 4 KB', 86, 419, 434),
-    ('binary 64 KB', 17, 80, 100),
-    ('binary 1 MB', 16, 30, 31),
-    ('binary 8 MB', 24, 25, 24),
-    ('text 4 KB', 103, 429, 426),
-    ('text 64 KB', 25, 108, 103),
-    ('text 1 MB', 52, 72, 40),
-    ('text 8 MB', 66, 84, 38),
-]
-# Cold cache (page cache evicted before each read), binary, median of 5.
-COLD_READS = [
-    ('binary 4 KB', 78, 280, 264),
-    ('binary 64 KB', 28, 77, 72),
-    ('binary 1 MB', 39, 31, 30),
-    ('binary 8 MB', 53, 25, 24),
-    ('128 MB stream', 19, 54, 51),
-]
-# (mode, urio[uring] MB/s, urio[thread] MB/s, aiofiles MB/s), warm, median of 5.
-STREAM = [
-    ('binary', 6255, 2958, 3108),
-    ('text', 1860, 1582, 1738),
+ARCHIVE_PREFIX = 'urio-benchmarks-historical/'
+SIZES = [
+    ('4 KB', 4 * 1024),
+    ('64 KB', 64 * 1024),
+    ('1 MB', 1024 * 1024),
+    ('8 MB', 8 * 1024 * 1024),
 ]
 
-# Windows IOCP: (label, urio[iocp] ms, thread ms, aiofiles ms). MEDIAN of 5 on
-# a Win10 8-core box, CPython 3.14, GIL. IOCP reaps completions on the loop
-# thread via asyncio's ProactorEventLoop IOCP with zero-copy writes AND
-# zero-copy reads (the kernel fills the returned bytes). Durable writes and
-# large text win; binary reads still lose — the warm ReadFile copy completes
-# inline on the loop thread, while aiofiles spreads it across the pool.
-WIN_WRITES = [
-    ('binary 4 KB', 113, 113, 113),
-    ('binary 64 KB', 57, 66, 76),
-    ('binary 1 MB', 28, 20, 23),
-    ('binary 8 MB', 33, 21, 16),
-    ('text 4 KB', 124, 122, 120),
-    ('text 64 KB', 118, 170, 157),
-    ('text 1 MB', 259, 406, 490),
-    ('text 8 MB', 553, 562, 849),
-]
-WIN_FSYNC = [
-    ('binary 4 KB', 207, 221, 230),
-    ('binary 64 KB', 144, 166, 173),
-    ('binary 1 MB', 132, 136, 128),
-    ('binary 8 MB', 217, 184, 194),
-    ('text 4 KB', 228, 244, 260),
-    ('text 64 KB', 206, 236, 280),
-    ('text 1 MB', 383, 550, 653),
-    ('text 8 MB', 778, 786, 1104),
-]
-WIN_READS = [
-    ('binary 4 KB', 190, 80, 88),
-    ('binary 64 KB', 97, 47, 50),
-    ('binary 1 MB', 30, 17, 18),
-    ('binary 8 MB', 72, 20, 18),
-    ('text 4 KB', 187, 91, 101),
-    ('text 64 KB', 141, 105, 120),
-    ('text 1 MB', 290, 364, 503),
-    ('text 8 MB', 547, 613, 730),
-]
 
-# Free-threading: GIL vs no-GIL on the SAME interpreter version. Each row is
-# (workload, GIL speedup, no-GIL speedup); speedup = aiofiles / urio (uring on
-# Linux, iocp on Windows). The unifying story: urio's warm-read edge is
-# memcpy/codec-bound, so removing the GIL lets aiofiles (and urio's own thread
-# backend) copy+decode across all cores and the edge erodes — on both backends.
+def _load_rows(archive: ZipFile, paths):
+    """Index raw benchmark rows; reject duplicate workload cells."""
+    rows = {}
+    for path in paths:
+        data = json.loads(archive.read(ARCHIVE_PREFIX + path))
+        for row in data['matrix']:
+            key = (row['mode'], row['size'], row['op'])
+            if key in rows:
+                raise ValueError(f'duplicate benchmark cell {key}: {path}')
+            rows[key] = row
+    return rows
 
-# Linux io_uring warm binary reads · CPython 3.14.6 vs 3.14.6t (matched build),
-# median of 5 on the Linux 4-core i5-6500, kernel 7.0 box. speedup = aiofiles /
-# urio[uring]. Small-read wins narrow under no-GIL (aiofiles copies across
-# cores) but stay wins; large reads flip the other way — 8 MB loses under the
-# GIL (one loop thread against a pool) but WINS without it (zero-copy handoff
-# + io-wq punt spread the copies just as well).
-NOGIL_URING_READS = [
-    ('binary 4 KB', 3.40, 2.24),
-    ('binary 64 KB', 2.88, 1.60),
-    ('binary 1 MB', 0.81, 0.97),
-    ('binary 8 MB', 0.49, 1.22),
-]
-# Windows IOCP (zero-copy) · CPython 3.14 vs 3.14t · speedup aiofiles / urio[iocp],
-# median of 5. Binary reads lose in both GIL states (inline loop-thread copy);
-# large text reads WIN under the GIL and drop below parity without it
-# (aiofiles/thread parallelise the decode+copy across cores); durable small
-# writes hold.
-NOGIL_WIN_IOCP = [
-    ('4 KB write+fsync', 1.11, 1.13),
-    ('4 KB read (binary)', 0.47, 0.64),
-    ('1 MB read (text)', 1.74, 0.75),
-    ('8 MB read (text)', 1.34, 0.69),
-    ('8 MB read (binary)', 0.25, 0.33),
-]
 
-# Filesystem impact — ext4-on-HDD vs ZFS, SAME urio build (HEAD), CPython 3.14.6
-# GIL, median of 7. urio[uring] absolute median ms for binary `write+fsync`, by
-# size. On ZFS every fsync forces a ZIL/txg commit, so durable-write latency
-# explodes — but aiofiles pays the identical tax (speedup vs aiofiles stays
-# ~1.0x), so this is the filesystem's cost, not urio's. The two boxes also differ
-# in CPU/RAM/kernel, so this is a ZFS *data point*, not a clean ext4-vs-ZFS A/B.
-# (ext4 ms = the FSYNC binary rows above; ZFS ms from the -zfs dataset.)
-ZFS_FSYNC = [  # (size, ext4 ms, ZFS ms)
-    ('4 KB', 94, 378),
-    ('64 KB', 17, 416),
-    ('1 MB', 16, 656),
-    ('8 MB', 24, 1695),
+def _matching_files(archive: ZipFile, pattern: str) -> list[str]:
+    return sorted(
+        name.removeprefix(ARCHIVE_PREFIX)
+        for name in archive.namelist()
+        if name.startswith(ARCHIVE_PREFIX)
+        and fnmatch.fnmatch(name.removeprefix(ARCHIVE_PREFIX), pattern)
+    )
+
+
+def _verify_archive(archive: ZipFile) -> None:
+    manifest = archive.read(ARCHIVE_PREFIX + 'SHA256SUMS.txt').decode()
+    for line in manifest.splitlines():
+        digest, name = line.split('  ', 1)
+        if hashlib.sha256(archive.read(ARCHIVE_PREFIX + name)).hexdigest() != digest:
+            raise ValueError(f'checksum mismatch: {name}')
+
+
+def _median(row, contender):
+    import statistics
+
+    return statistics.median(row['samples'][contender])
+
+
+def _ratio(row, native):
+    """Ratio of contender medians, matching the benchmark report."""
+    return _median(row, 'aiofiles') / _median(row, native)
+
+
+def _operation_rows(rows, operation, native):
+    result = []
+    for mode in ('binary', 'text'):
+        for label, size in SIZES:
+            row = rows[(mode, size, operation)]
+            result.append(
+                (
+                    f'{mode} {label}',
+                    *(
+                        _median(row, name) * 1000
+                        for name in (native, 'urio[thread]', 'aiofiles')
+                    ),
+                )
+            )
+    return result
+
+
+WIN_NOGIL_CELLS = [
+    ('4 KB write+fsync', 'binary', 4 * 1024, 'write+fsync'),
+    ('4 KB read (binary)', 'binary', 4 * 1024, 'read'),
+    ('1 MB read (text)', 'text', 1024 * 1024, 'read'),
+    ('8 MB read (text)', 'text', 8 * 1024 * 1024, 'read'),
+    ('8 MB read (binary)', 'binary', 8 * 1024 * 1024, 'read'),
 ]
 EXT4_C = '#3b6ea5'
 ZFS_C = '#e08a3c'
 
-FASTER = '#2a9d4a'  # urio faster than aiofiles
-SLOWER = '#d9772b'  # urio slower than aiofiles
+FASTER = '#2a9d4a'
+SLOWER = '#d9772b'
 URING = '#3b6ea5'
 THREAD = '#8fb3d9'
 AIOFILES = '#b0b0b0'
-GIL_C = '#3b6ea5'  # GIL series
-NOGIL_C = '#e08a3c'  # no-GIL series
+GIL_C = '#3b6ea5'
+NOGIL_C = '#e08a3c'
 TEXT = '#222222'
 GRID = '#cccccc'
 
 
-# One colour per file size — used across the consolidated grouped charts so a
-# reader learns the palette once.
 SIZE_COLORS = [
-    ('4 KB', '#3b6ea5'),  # blue
-    ('64 KB', '#2a9d4a'),  # green
-    ('1 MB', '#e08a3c'),  # orange
-    ('8 MB', '#b5539c'),  # purple
+    ('4 KB', '#3b6ea5'),
+    ('64 KB', '#2a9d4a'),
+    ('1 MB', '#e08a3c'),
+    ('8 MB', '#b5539c'),
 ]
 
 
@@ -204,7 +146,6 @@ def grouped_speedup_chart(title, platform, subtitle, groups, matrix, filename):
         f'fill="{URING}">{_esc(platform)}</text>',
         f'<text x="{Lm}" y="68" font-size="12" fill="#666">{_esc(subtitle)}</text>',
     ]
-    # legend (sizes)
     lx = Lm
     for slabel, color in SIZE_COLORS:
         p.append(f'<rect x="{lx}" y="80" width="12" height="12" fill="{color}"/>')
@@ -212,7 +153,6 @@ def grouped_speedup_chart(title, platform, subtitle, groups, matrix, filename):
             f'<text x="{lx + 16}" y="90" font-size="11" fill="{TEXT}">{slabel}</text>'
         )
         lx += 66
-    # parity line
     x1 = x(1.0)
     p.append(
         f'<line x1="{x1:.1f}" y1="{Tm - 8}" x2="{x1:.1f}" y2="{H - Bm + 2}" '
@@ -272,7 +212,6 @@ def speedup_chart(
         f'<text x="{Lm}" y="50" font-size="12" fill="#666">'
         f'speedup vs aiofiles — bars right of the 1.0 line mean urio is faster</text>',
     ]
-    # 1.0 parity line
     x1 = x(1.0)
     p.append(
         f'<line x1="{x1:.1f}" y1="{Tm - 6}" x2="{x1:.1f}" y2="{H - Bm + 4}" '
@@ -314,8 +253,6 @@ def gil_speedup_chart(
     """
     xmax = max([max(g, n) for _, g, n in rows] + [1.0]) * 1.18
 
-    # Title, platform, and subtitle each get their own line so long labels
-    # (which name OS · backend · Python build) never collide or clip.
     Lm, Rm, Tm, Bm = 170, 40, 116, 34
     row_h, bar_h, bar_gap = 46, 16, 4
     plot_w = 610
@@ -336,7 +273,6 @@ def gil_speedup_chart(
         f'fill="{NOGIL_C}">{_esc(platform)}</text>',
         f'<text x="{Lm}" y="68" font-size="12" fill="#666">{_esc(subtitle)}</text>',
     ]
-    # legend
     ly = 88
     p.append(f'<rect x="{Lm}" y="{ly}" width="12" height="12" fill="{GIL_C}"/>')
     p.append(
@@ -379,9 +315,7 @@ def gil_speedup_chart(
 
 
 def zfs_fsync_chart(title, subtitle, rows, filename) -> None:
-    """Horizontal grouped bars of absolute urio[uring] median ms, ext4 vs ZFS,
-    per size. Values are labelled in ms with the ZFS/ext4 factor on the ZFS bar,
-    so the durable-write filesystem tax is legible despite the wide range."""
+    """Show fsync-workload times on two machines; hardware also differs."""
     xmax = max(v for _, _e, z in rows for v in (_e, z)) * 1.22
     Lm, Rm, Tm, Bm = 90, 60, 108, 26
     row_h, bar_h, bar_gap = 46, 16, 4
@@ -421,8 +355,8 @@ def zfs_fsync_chart(title, subtitle, rows, filename) -> None:
         )
         for j, (val, color, extra) in enumerate(
             (
-                (e, EXT4_C, f'{e} ms'),
-                (z, ZFS_C, f'{z} ms ({z / e:.0f}×)'),
+                (e, EXT4_C, f'{e:.1f} ms'),
+                (z, ZFS_C, f'{z:.1f} ms ({z / e:.1f}×)'),
             )
         ):
             by = y0 + j * (bar_h + bar_gap)
@@ -467,7 +401,6 @@ def grouped_chart(title: str, subtitle: str, rows, filename: str) -> None:
         f'<line x1="{Lm}" y1="{Tm + plot_h}" x2="{W - Rm}" y2="{Tm + plot_h}" '
         f'stroke="{GRID}"/>',
     ]
-    # legend
     lx = Lm
     for name, color in series:
         p.append(
@@ -511,7 +444,7 @@ OP_GROUPS = [
     'read · binary',
     'read · text',
 ]
-_SPEEDUP_SUB = 'speedup vs aiofiles — bars past the 1.0x line mean urio is faster'
+_SPEEDUP_SUB = 'aiofiles median / urio median · above 1.0x means urio was faster'
 
 
 def _op_matrix(writes, fsync, reads):
@@ -522,38 +455,84 @@ def _op_matrix(writes, fsync, reads):
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('archive', type=pathlib.Path)
+    args = parser.parse_args()
+    with ZipFile(args.archive) as archive:
+        _verify_archive(archive)
+        linux = _load_rows(archive, ['linux-x86_64-3.14-uring.json'])
+        linux_nogil = _load_rows(archive, ['linux-x86_64-3.14t-uring.json'])
+        zfs = _load_rows(archive, ['linux-x86_64-3.14-uring-zfs.json'])
+        windows = _load_rows(
+            archive,
+            _matching_files(archive, 'windows-x86_64-3.14-iocp-thread-*files.json'),
+        )
+        windows_nogil = _load_rows(
+            archive,
+            _matching_files(archive, 'windows-x86_64-3.14t-iocp-thread-*files.json'),
+        )
+
+    reads = _operation_rows(linux, 'read', 'urio[uring]')
+    writes = _operation_rows(linux, 'write', 'urio[uring]')
+    fsync = _operation_rows(linux, 'write+fsync', 'urio[uring]')
+    win_reads = _operation_rows(windows, 'read', 'urio[iocp]')
+    win_writes = _operation_rows(windows, 'write', 'urio[iocp]')
+    win_fsync = _operation_rows(windows, 'write+fsync', 'urio[iocp]')
+    nogil_uring_reads = [
+        (
+            f'binary {label}',
+            _ratio(linux[('binary', size, 'read')], 'urio[uring]'),
+            _ratio(linux_nogil[('binary', size, 'read')], 'urio[uring]'),
+        )
+        for label, size in SIZES
+    ]
+    nogil_win_iocp = [
+        (
+            label,
+            _ratio(windows[(mode, size, operation)], 'urio[iocp]'),
+            _ratio(windows_nogil[(mode, size, operation)], 'urio[iocp]'),
+        )
+        for label, mode, size, operation in WIN_NOGIL_CELLS
+    ]
+    zfs_fsync = [
+        (
+            label,
+            _median(linux[('binary', size, 'write+fsync')], 'urio[uring]') * 1000,
+            _median(zfs[('binary', size, 'write+fsync')], 'urio[uring]') * 1000,
+        )
+        for label, size in SIZES
+    ]
+
     OUT.mkdir(parents=True, exist_ok=True)
-    # Three dense charts, one per platform/topic, rather than a dozen small ones.
     grouped_speedup_chart(
         'Linux · io_uring vs aiofiles',
-        'Linux · io_uring · CPython 3.14 · median of 5',
+        'Archived Linux · CPython 3.14.6 · 5 repeats · fixed order',
         _SPEEDUP_SUB,
         OP_GROUPS,
-        _op_matrix(WRITES, FSYNC, READS),
+        _op_matrix(writes, fsync, reads),
         'bench-linux.svg',
     )
     grouped_speedup_chart(
         'Windows · IOCP vs aiofiles',
-        'Windows · IOCP · CPython 3.14 · median of 5',
+        'Archived Windows · CPython 3.14 · 5 repeats · fixed order',
         _SPEEDUP_SUB,
         OP_GROUPS,
-        _op_matrix(WIN_WRITES, WIN_FSYNC, WIN_READS),
+        _op_matrix(win_writes, win_fsync, win_reads),
         'bench-windows.svg',
     )
-    nogil_rows = [(f'io_uring · {lbl}', g, n) for lbl, g, n in NOGIL_URING_READS]
-    nogil_rows += [(f'IOCP · {lbl}', g, n) for lbl, g, n in NOGIL_WIN_IOCP]
+    nogil_rows = [(f'io_uring · {lbl}', g, n) for lbl, g, n in nogil_uring_reads]
+    nogil_rows += [(f'IOCP · {lbl}', g, n) for lbl, g, n in nogil_win_iocp]
     gil_speedup_chart(
-        'Free-threading shifts warm reads to the thread pool',
+        'Warm reads with and without the GIL',
         nogil_rows,
         'bench-nogil.svg',
-        'Linux io_uring & Windows IOCP · CPython 3.14 vs 3.14t',
-        'urio runs GIL-free (gil_used=false); no-GIL lets urio’s thread backend, like aiofiles, copy on N cores',
+        'Archived Linux and Windows · CPython 3.14 vs 3.14t',
+        'aiofiles median / urio median · above 1.0x means urio was faster',
     )
     zfs_fsync_chart(
-        'ZFS taxes durable writes',
-        'io_uring · CPython 3.14.6 GIL · median of 7 · aiofiles pays the same tax '
-        '(speedup ~1.0×)',
-        ZFS_FSYNC,
+        'Write and fsync on two Linux machines',
+        'Archived CPython 3.14.6 · 5/7 repeats · different hardware',
+        zfs_fsync,
         'bench-zfs.svg',
     )
 

@@ -15,12 +15,10 @@ delivered to the loop with a single ``loop.call_soon_threadsafe`` per batch, so
 the cross-thread wakeup is amortised across a burst of ops rather than paid once
 per operation.
 
-Validated on Windows 10/11 (CPython 3.14, GIL and free-threaded): the full
-file+path test suite and a concurrency/cancellation stress test pass. Opt-in
-because warm-cache reads remain memcpy-bound — the read copy is single-threaded,
-while aiofiles' thread pool spreads it across cores — so Windows defaults to the
-thread-pool backend (aiofiles-class). Writes are zero-copy and at parity;
-durable writes win.
+The IOCP backend is opt-in. Earlier Windows 10/11 measurements with CPython
+3.14 found slower concurrent binary reads than the thread backend; see the
+benchmark documentation for the workload and limits of those measurements.
+Windows uses the thread backend by default.
 """
 
 from __future__ import annotations
@@ -31,11 +29,6 @@ import weakref
 
 from . import _uring
 
-# Cached as an attribute on the loop object so the driver (and its poller
-# thread + completion port) dies with the loop. A WeakKeyDictionary keyed by
-# loop would never release entries: the driver strongly references the loop, so
-# the dict's strong value reference keeps the key alive forever. The dict below
-# is only a weak-VALUE fallback for loops that reject attribute assignment.
 _DRIVER_ATTR = '_urio_iocp_driver'
 _drivers: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
@@ -46,35 +39,58 @@ class IocpDriver:
     def __init__(self, loop: asyncio.AbstractEventLoop):
         self._loop = loop
         self._futures: dict[int, asyncio.Future] = {}
-        # The native poller thread delivers a whole batch of completions via one
-        # call_soon_threadsafe(self._on_complete, batch), so it runs back on the
-        # loop thread.
+        self._open_ids: set[int] = set()
         self._iocp = _uring.Iocp(loop, self._on_complete)
 
     def _on_complete(self, batch) -> None:
-        # batch is a list of (ident, status, value, data) tuples reaped together.
         for ident, status, value, data in batch:
             fut = self._futures.pop(ident, None)
+            was_open = ident in self._open_ids
+            self._open_ids.discard(ident)
             if fut is None or fut.done():
+                if was_open and status == 0:
+                    try:
+                        self._iocp.close_now(value)
+                    except OSError:
+                        pass
                 continue
             if status != 0:
-                # status is a Win32 error code; FormatError gives a real message
-                # and the code is preserved as the OSError winerror.
                 fut.set_exception(OSError(0, ctypes.FormatError(status), None, status))
             else:
                 fut.set_result((value, data))
 
-    async def _run(self, submit):
+    async def _run(self, submit, *, opens_handle: bool = False):
         fut = self._loop.create_future()
         ident = submit(self._iocp)
         self._futures[ident] = fut
-        return await fut
+        if opens_handle:
+            self._open_ids.add(ident)
+        try:
+            return await asyncio.shield(fut) if opens_handle else await fut
+        except asyncio.CancelledError:
+            if opens_handle:
+                if fut.done():
+                    self._close_abandoned_open(fut)
+                else:
+                    fut.add_done_callback(self._close_abandoned_open)
+            raise
+
+    def _close_abandoned_open(self, fut: asyncio.Future) -> None:
+        try:
+            handle, _ = fut.result()
+        except BaseException:
+            return
+        try:
+            self._iocp.close_now(handle)
+        except OSError:
+            pass
 
     async def open(
         self, path: str, write: bool, create: bool, truncate: bool, exclusive: bool
     ) -> int:
         handle, _ = await self._run(
-            lambda i: i.submit_open(path, write, create, truncate, exclusive)
+            lambda i: i.submit_open(path, write, create, truncate, exclusive),
+            opens_handle=True,
         )
         return handle
 

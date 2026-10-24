@@ -30,8 +30,6 @@ class AsyncPath:
             parts = [s._path if isinstance(s, AsyncPath) else s for s in segments]
             self._path = pathlib.Path(*parts) if parts else pathlib.Path()
 
-    # -- construction / dunders ------------------------------------------
-
     @classmethod
     def _wrap(cls, path: pathlib.Path) -> AsyncPath:
         obj = cls.__new__(cls)
@@ -72,8 +70,6 @@ class AsyncPath:
     def __rtruediv__(self, other):
         other = other._path if isinstance(other, AsyncPath) else other
         return self._wrap(other / self._path)
-
-    # -- pure path properties (no I/O) -----------------------------------
 
     @property
     def name(self):
@@ -151,8 +147,6 @@ class AsyncPath:
     def expanduser(self) -> AsyncPath:
         return self._wrap(self._path.expanduser())
 
-    # -- filesystem I/O (async) ------------------------------------------
-
     async def stat(self):
         return await get_backend().statx(str(self._path), follow=True)
 
@@ -194,8 +188,6 @@ class AsyncPath:
         )
 
     async def read_bytes(self):
-        # Backends with linked open→read chains (io_uring) read a whole small
-        # file in a single kernel round-trip; others take the classic path.
         backend = get_backend()
         fast = getattr(backend, 'read_file', None)
         if fast is not None:
@@ -219,8 +211,6 @@ class AsyncPath:
             if encoding is None:
                 encoding = locale.getpreferredencoding(False)
             text = data.decode(encoding, errors or 'strict')
-            # Universal newlines, matching open(mode='r', newline=None): a
-            # whole-file decode + translate equals the incremental path.
             if '\r' in text:
                 text = text.replace('\r\n', '\n').replace('\r', '\n')
             return text
@@ -280,9 +270,6 @@ class AsyncPath:
         return self._wrap(pathlib.Path(target))
 
     async def replace(self, target):
-        # Atomically replace an existing destination. POSIX rename(2) overwrites,
-        # but Windows MoveFile (os.rename) fails if the target exists — os.replace
-        # does the atomic overwrite on every platform, so route through it.
         target = target._path if isinstance(target, AsyncPath) else target
         await get_backend().replace(str(self._path), os.fspath(target))
         return self._wrap(pathlib.Path(target))
@@ -320,7 +307,8 @@ class AsyncPath:
         return self._wrap(pathlib.Path(await get_backend().readlink(str(self._path))))
 
     async def resolve(self, strict=False):
-        return self._wrap(pathlib.Path(await get_backend().realpath(str(self._path))))
+        path = await get_backend().realpath(str(self._path), strict=strict)
+        return self._wrap(pathlib.Path(path))
 
     def absolute(self):
         return self._wrap(self._path.absolute())

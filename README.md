@@ -46,10 +46,8 @@ pip install urio
 ```
 
 Published `abi3` wheels cover regular CPython 3.12 and newer, including
-3.15. Free-threaded Python needs a version-specific wheel. The 0.2.0
-release has 3.14t wheels; this source tree builds both 3.14t and 3.15t.
-Until a 3.15t wheel is published, install it from a checkout with Rust and
-maturin. Supported platforms are:
+3.15. Free-threaded Python needs a version-specific wheel. The 0.3.0
+release provides both 3.14t and 3.15t wheels. Supported platforms are:
 
 | Platform | Arch | Backend |
 |---|---|---|

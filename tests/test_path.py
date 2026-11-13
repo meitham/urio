@@ -206,6 +206,19 @@ async def test_touch_exclusive(backend, tmp_path):
         await p.touch(exist_ok=False)
 
 
+async def test_touch_reports_utime_error(backend, tmp_path, monkeypatch):
+    p = urio.Path(tmp_path) / 'exists'
+    await p.write_bytes(b'x')
+    active = urio.get_backend()
+
+    async def failing_utime(path, times):
+        raise PermissionError(13, 'timestamp denied')
+
+    monkeypatch.setattr(active, 'utime', failing_utime)
+    with pytest.raises(PermissionError, match='timestamp denied'):
+        await p.touch()
+
+
 @skip_on_windows
 async def test_chmod(backend, tmp_path):
     p = urio.Path(tmp_path) / 'perm'

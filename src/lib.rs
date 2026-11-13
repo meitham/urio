@@ -208,6 +208,14 @@ impl Ring {
         if need_flush {
             self.ring.submit()?;
         }
+        if {
+            let sq = self.ring.submission();
+            sq.capacity() - sq.len() < 2
+        } {
+            return Err(io::Error::other(
+                "submission queue has no room for a linked pair",
+            ));
+        }
         unsafe {
             let mut sq = self.ring.submission();
             sq.push(first)
@@ -763,7 +771,7 @@ impl Ring {
             }
         }
         let mut out: Vec<Py<PyAny>> = Vec::with_capacity(raw.len());
-        for (id, res) in raw {
+        for (id, mut res) in raw {
             let pending = self.pending.remove(&id);
             let payload: Py<PyAny> = if res < 0 {
                 py.None()
@@ -776,11 +784,25 @@ impl Ring {
                         } else {
                             let p =
                                 unsafe { pyo3::ffi::PyBytes_AsString(buf.as_ptr()) as *const u8 };
-                            let s = unsafe { std::slice::from_raw_parts(p, n) };
-                            PyBytes::new(py, s).into()
+                            match alloc_pybytes(py, n) {
+                                Ok((copy, dest)) => {
+                                    unsafe { std::ptr::copy_nonoverlapping(p, dest, n) };
+                                    copy.into_any()
+                                }
+                                Err(_) => {
+                                    res = -libc::ENOMEM;
+                                    py.None()
+                                }
+                            }
                         }
                     }
-                    Some(Pending::Statx { stx, .. }) => statx_tuple(py, &stx)?,
+                    Some(Pending::Statx { stx, .. }) => match statx_tuple(py, &stx) {
+                        Ok(value) => value,
+                        Err(_) => {
+                            res = -libc::ENOMEM;
+                            py.None()
+                        }
+                    },
                     _ => py.None(),
                 }
             };
@@ -894,7 +916,9 @@ mod iocp {
     use std::collections::HashMap;
     use std::ffi::c_void;
     use std::os::windows::ffi::OsStrExt;
+    use std::sync::atomic::AtomicBool;
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::Arc;
     use std::thread::JoinHandle;
 
     use pyo3::prelude::*;
@@ -904,8 +928,8 @@ mod iocp {
     };
     use windows_sys::Win32::Storage::FileSystem::{CreateFileW, ReadFile, WriteFile};
     use windows_sys::Win32::System::IO::{
-        CreateIoCompletionPort, GetQueuedCompletionStatusEx, PostQueuedCompletionStatus,
-        OVERLAPPED, OVERLAPPED_ENTRY,
+        CancelIoEx, CreateIoCompletionPort, GetQueuedCompletionStatusEx,
+        PostQueuedCompletionStatus, OVERLAPPED, OVERLAPPED_ENTRY,
     };
 
     const STATUS_END_OF_FILE: u32 = 0xC000_0011;
@@ -928,6 +952,7 @@ mod iocp {
     const INFINITE: u32 = 0xFFFF_FFFF;
     const ERROR_HANDLE_EOF: u32 = 38;
     const SHUTDOWN_KEY: usize = usize::MAX;
+    const FAILURE_KEY: usize = usize::MAX - 1;
 
     const OP_READ: u8 = 0;
     const OP_WRITE: u8 = 1;
@@ -969,15 +994,16 @@ mod iocp {
 
     /// Consume a completed read's buffer: the whole object on a full read,
     /// a prefix copy on a short one.
-    fn take_read_payload(py: Python<'_>, op: &mut Op, n: usize) -> Py<PyAny> {
+    fn take_read_payload(py: Python<'_>, op: &mut Op, n: usize) -> PyResult<Py<PyAny>> {
         match op.rbuf.take() {
-            Some(b) if n == op.rcap => b.into_any(),
+            Some(b) if n == op.rcap => Ok(b.into_any()),
             Some(b) => {
                 let p = unsafe { pyo3::ffi::PyBytes_AsString(b.as_ptr()) as *const u8 };
-                let s = unsafe { std::slice::from_raw_parts(p, n) };
-                PyBytes::new(py, s).into()
+                let (copy, dest) = alloc_pybytes(py, n)?;
+                unsafe { std::ptr::copy_nonoverlapping(p, dest, n) };
+                Ok(copy.into_any())
             }
-            None => py.None(),
+            None => Ok(py.None()),
         }
     }
 
@@ -988,18 +1014,44 @@ mod iocp {
             .collect()
     }
 
+    fn win_error(operation: &str, code: u32) -> PyErr {
+        pyo3::exceptions::PyOSError::new_err((
+            0i32,
+            format!("{operation} failed (winerror {code})"),
+            Option::<String>::None,
+            code as i32,
+        ))
+    }
+
     #[pyclass(unsendable)]
     pub struct Iocp {
         port: isize,
         next_id: AtomicU64,
         poller: Option<JoinHandle<()>>,
+        broken: Arc<AtomicBool>,
     }
 
     impl Iocp {
-        fn post(&self, op: *mut Op) {
-            unsafe {
-                PostQueuedCompletionStatus(self.port as *mut c_void, 0, 0, op as *const OVERLAPPED);
+        fn check_ready(&self) -> PyResult<()> {
+            if self.port == 0 || self.broken.load(Ordering::Acquire) {
+                return Err(win_error("IOCP poller", 6));
             }
+            Ok(())
+        }
+
+        fn post(&self, op: *mut Op) -> PyResult<()> {
+            if unsafe {
+                PostQueuedCompletionStatus(self.port as *mut c_void, 0, 0, op as *const OVERLAPPED)
+            } == 0
+            {
+                let error = unsafe { GetLastError() };
+                let op = unsafe { Box::from_raw(op) };
+                if op.kind == OP_OPEN && op.status == 0 {
+                    unsafe { CloseHandle(op.handle as *mut c_void) };
+                }
+                return Err(win_error("PostQueuedCompletionStatus", error));
+            }
+            Ok(())
         }
 
         /// Signal the poller thread to stop and wait for it, then close the
@@ -1009,48 +1061,98 @@ mod iocp {
         /// handles and may be mid `call_soon_threadsafe`. Joining while holding
         /// the GIL therefore deadlocks (only under a real GIL — free-threaded
         /// builds are unaffected, which is why this hid on GIL Windows alone).
-        fn stop_poller(&mut self) {
+        fn stop_poller(&mut self) -> PyResult<()> {
             if self.poller.is_none() {
-                return;
+                return Ok(());
             }
-            unsafe {
+            let posted = unsafe {
                 PostQueuedCompletionStatus(
                     self.port as *mut c_void,
                     0,
                     SHUTDOWN_KEY,
                     std::ptr::null(),
-                );
+                )
+            };
+            let post_error = if posted == 0 {
+                Some(unsafe { GetLastError() })
+            } else {
+                None
+            };
+            if post_error.is_some() {
+                unsafe { CloseHandle(self.port as *mut c_void) };
             }
-            if let Some(j) = self.poller.take() {
-                Python::attach(|py| {
-                    py.detach(|| {
-                        let _ = j.join();
-                    })
-                });
+            let join_failed = self
+                .poller
+                .take()
+                .is_some_and(|j| Python::attach(|py| py.detach(|| j.join())).is_err());
+            let closed = if post_error.is_none() {
+                unsafe { CloseHandle(self.port as *mut c_void) }
+            } else {
+                1
+            };
+            let close_error = if closed == 0 {
+                Some(unsafe { GetLastError() })
+            } else {
+                None
+            };
+            self.port = 0;
+            if join_failed {
+                return Err(pyo3::exceptions::PyOSError::new_err("IOCP poller panicked"));
             }
-            unsafe {
-                CloseHandle(self.port as *mut c_void);
+            if let Some(code) = post_error {
+                return Err(win_error("PostQueuedCompletionStatus", code));
             }
+            if let Some(code) = close_error {
+                return Err(win_error("CloseHandle", code));
+            }
+            Ok(())
         }
     }
 
     #[pymethods]
     impl Iocp {
         #[new]
-        fn new(loop_obj: Py<PyAny>, on_complete: Py<PyAny>) -> PyResult<Self> {
+        fn new(loop_obj: Py<PyAny>, on_complete: Py<PyAny>, on_error: Py<PyAny>) -> PyResult<Self> {
             let port =
                 unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, std::ptr::null_mut(), 0, 0) };
             if port.is_null() {
-                return Err(pyo3::exceptions::PyOSError::new_err(
-                    "CreateIoCompletionPort failed",
-                ));
+                return Err(win_error("CreateIoCompletionPort", unsafe {
+                    GetLastError()
+                }));
             }
             let port_i = port as isize;
-            let poller = std::thread::spawn(move || poll_loop(port_i, loop_obj, on_complete));
+            let broken = Arc::new(AtomicBool::new(false));
+            let thread_broken = Arc::clone(&broken);
+            let panic_broken = Arc::clone(&broken);
+            let panic_loop = Python::attach(|py| loop_obj.clone_ref(py));
+            let panic_callback = Python::attach(|py| on_error.clone_ref(py));
+            let poller = std::thread::Builder::new()
+                .name("urio-iocp".to_owned())
+                .spawn(move || {
+                    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        poll_loop(port_i, loop_obj, on_complete, on_error, thread_broken)
+                    }));
+                    if result.is_err() {
+                        panic_broken.store(true, Ordering::Release);
+                        Python::attach(|py| {
+                            if let Err(error) = panic_loop.bind(py).call_method1(
+                                "call_soon_threadsafe",
+                                (panic_callback.bind(py), 8u32),
+                            ) {
+                                error.write_unraisable(py, Some(panic_loop.bind(py)));
+                            }
+                        });
+                    }
+                })
+                .map_err(|error| {
+                    unsafe { CloseHandle(port) };
+                    pyo3::exceptions::PyOSError::new_err(error.to_string())
+                })?;
             Ok(Iocp {
                 port: port_i,
                 next_id: AtomicU64::new(1),
                 poller: Some(poller),
+                broken,
             })
         }
 
@@ -1061,7 +1163,8 @@ mod iocp {
             create: bool,
             truncate: bool,
             exclusive: bool,
-        ) -> u64 {
+        ) -> PyResult<u64> {
+            self.check_ready()?;
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let w = wide(path);
             let access = if write {
@@ -1113,8 +1216,8 @@ mod iocp {
                 handle: handle as isize,
                 status,
             });
-            self.post(Box::into_raw(op));
-            id
+            self.post(Box::into_raw(op))?;
+            Ok(id)
         }
 
         fn submit_read(
@@ -1124,6 +1227,7 @@ mod iocp {
             offset: u64,
             len: u32,
         ) -> PyResult<u64> {
+            self.check_ready()?;
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let (rbuf, rptr) = alloc_pybytes(py, len as usize)?;
             let mut op = Box::new(Op {
@@ -1153,22 +1257,23 @@ mod iocp {
                     let e = GetLastError();
                     if e == ERROR_IO_PENDING {
                     } else if e == ERROR_HANDLE_EOF {
-                        PostQueuedCompletionStatus(
-                            self.port as *mut c_void,
-                            nread,
-                            0,
-                            ptr as *const OVERLAPPED,
-                        );
+                        self.post(ptr)?;
                     } else {
                         (*ptr).status = e as i32;
-                        self.post(ptr);
+                        self.post(ptr)?;
                     }
                 }
             }
             Ok(id)
         }
 
-        fn submit_write(&self, handle: isize, offset: u64, data: Bound<'_, PyBytes>) -> u64 {
+        fn submit_write(
+            &self,
+            handle: isize,
+            offset: u64,
+            data: Bound<'_, PyBytes>,
+        ) -> PyResult<u64> {
+            self.check_ready()?;
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let (dptr, len) = {
                 let b = data.as_bytes();
@@ -1200,14 +1305,15 @@ mod iocp {
                     let e = GetLastError();
                     if e != ERROR_IO_PENDING {
                         (*ptr).status = e as i32;
-                        self.post(ptr);
+                        self.post(ptr)?;
                     }
                 }
             }
-            id
+            Ok(id)
         }
 
-        fn submit_close(&self, handle: isize) -> u64 {
+        fn submit_close(&self, handle: isize) -> PyResult<u64> {
+            self.check_ready()?;
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let status = unsafe {
                 if CloseHandle(handle as *mut c_void) == 0 {
@@ -1227,8 +1333,8 @@ mod iocp {
                 handle: 0,
                 status,
             });
-            self.post(Box::into_raw(op));
-            id
+            self.post(Box::into_raw(op))?;
+            Ok(id)
         }
 
         /// Release a successful open whose Python awaiter was cancelled.
@@ -1245,14 +1351,33 @@ mod iocp {
             Ok(())
         }
 
-        fn shutdown(&mut self) {
-            self.stop_poller();
+        fn shutdown(&mut self) -> PyResult<()> {
+            self.stop_poller()
+        }
+
+        fn _test_fail_poller(&self, code: u32) -> PyResult<()> {
+            if unsafe {
+                PostQueuedCompletionStatus(
+                    self.port as *mut c_void,
+                    code,
+                    FAILURE_KEY,
+                    std::ptr::null(),
+                )
+            } == 0
+            {
+                return Err(win_error("PostQueuedCompletionStatus", unsafe {
+                    GetLastError()
+                }));
+            }
+            Ok(())
         }
     }
 
     impl Drop for Iocp {
         fn drop(&mut self) {
-            self.stop_poller();
+            if let Err(error) = self.stop_poller() {
+                Python::attach(|py| error.write_unraisable(py, None));
+            }
         }
     }
 
@@ -1262,7 +1387,13 @@ mod iocp {
     /// single `call_soon_threadsafe` under one GIL acquire — so the per-op
     /// cross-thread wakeup and GIL hand-off are amortised across the burst rather
     /// than paid once per operation.
-    fn poll_loop(port_i: isize, loop_obj: Py<PyAny>, on_complete: Py<PyAny>) {
+    fn poll_loop(
+        port_i: isize,
+        loop_obj: Py<PyAny>,
+        on_complete: Py<PyAny>,
+        on_error: Py<PyAny>,
+        broken: Arc<AtomicBool>,
+    ) {
         let port = port_i as *mut c_void;
         let mut entries: [OVERLAPPED_ENTRY; BATCH] = unsafe { std::mem::zeroed() };
         loop {
@@ -1278,21 +1409,35 @@ mod iocp {
                 )
             };
             if ok == 0 {
+                broken.store(true, Ordering::Release);
+                let error = unsafe { GetLastError() };
+                Python::attach(|py| {
+                    if let Err(err) = loop_obj
+                        .bind(py)
+                        .call_method1("call_soon_threadsafe", (on_error.bind(py), error))
+                    {
+                        err.write_unraisable(py, Some(loop_obj.bind(py)));
+                    }
+                });
                 break;
             }
             let mut shutdown = false;
+            let mut failure = None;
             Python::attach(|py| {
                 let batch = PyList::empty(py);
+                let mut opened = Vec::new();
                 for entry in &entries[..removed as usize] {
                     if entry.lpOverlapped.is_null() {
                         if entry.lpCompletionKey == SHUTDOWN_KEY {
                             shutdown = true;
+                        } else if entry.lpCompletionKey == FAILURE_KEY {
+                            failure = Some(entry.dwNumberOfBytesTransferred);
                         }
                         continue;
                     }
                     let mut op = unsafe { Box::from_raw(entry.lpOverlapped as *mut Op) };
                     let nbytes = entry.dwNumberOfBytesTransferred;
-                    let status = if op.status != 0 {
+                    let mut status = if op.status != 0 {
                         op.status
                     } else {
                         let nt = op.ov.Internal as u32;
@@ -1308,18 +1453,53 @@ mod iocp {
                         _ => 0,
                     };
                     let data: Py<PyAny> = if op.kind == OP_READ && status == 0 {
-                        take_read_payload(py, &mut op, nbytes as usize)
+                        match take_read_payload(py, &mut op, nbytes as usize) {
+                            Ok(data) => data,
+                            Err(err) => {
+                                err.write_unraisable(py, Some(loop_obj.bind(py)));
+                                failure = Some(8);
+                                status = 8;
+                                py.None()
+                            }
+                        }
                     } else {
                         py.None()
                     };
-                    let _ = batch.append((op.id, status, value, data));
+                    if let Err(err) = batch.append((op.id, status, value, data)) {
+                        err.write_unraisable(py, Some(loop_obj.bind(py)));
+                        failure = Some(8);
+                        if op.kind == OP_OPEN && status == 0 {
+                            unsafe { CloseHandle(op.handle as *mut c_void) };
+                        }
+                    } else if op.kind == OP_OPEN && status == 0 {
+                        opened.push(op.handle);
+                    }
                 }
                 if batch.len() > 0 {
                     let cb = loop_obj.bind(py);
-                    let _ = cb.call_method1("call_soon_threadsafe", (on_complete.bind(py), &batch));
+                    if let Err(err) =
+                        cb.call_method1("call_soon_threadsafe", (on_complete.bind(py), &batch))
+                    {
+                        err.write_unraisable(py, Some(cb));
+                        for handle in opened {
+                            unsafe { CloseHandle(handle as *mut c_void) };
+                        }
+                        failure = Some(8);
+                    }
+                }
+                if let Some(code) = failure {
+                    if let Err(err) = loop_obj
+                        .bind(py)
+                        .call_method1("call_soon_threadsafe", (on_error.bind(py), code))
+                    {
+                        err.write_unraisable(py, Some(loop_obj.bind(py)));
+                    }
                 }
             });
-            if shutdown {
+            if shutdown || failure.is_some() {
+                if failure.is_some() {
+                    broken.store(true, Ordering::Release);
+                }
                 break;
             }
         }
@@ -1332,8 +1512,17 @@ mod iocp {
         pending: RefCell<HashMap<usize, Box<Op>>>,
     }
 
+    impl Drop for ProactorIo {
+        fn drop(&mut self) {
+            for (_, op) in self.pending.get_mut().drain() {
+                std::mem::forget(op);
+            }
+        }
+    }
+
     impl ProactorIo {
-        fn launch_read(&self, handle: isize, mut op: Box<Op>, len: u32) -> usize {
+        fn launch_read(&self, handle: isize, mut op: Box<Op>, len: u32) -> PyResult<usize> {
+            op.handle = handle;
             let op_ptr = op.as_mut() as *mut Op;
             let addr = op_ptr as usize;
             self.pending.borrow_mut().insert(addr, op);
@@ -1350,27 +1539,44 @@ mod iocp {
                     let e = GetLastError();
                     if e == ERROR_IO_PENDING {
                     } else if e == ERROR_HANDLE_EOF {
-                        PostQueuedCompletionStatus(
+                        if PostQueuedCompletionStatus(
                             self.iocp as *mut c_void,
                             nread,
                             0,
                             &mut (*op_ptr).ov,
-                        );
+                        ) == 0
+                        {
+                            let error = GetLastError();
+                            self.pending.borrow_mut().remove(&addr);
+                            return Err(win_error("PostQueuedCompletionStatus", error));
+                        }
                     } else {
                         (*op_ptr).status = e as i32;
-                        PostQueuedCompletionStatus(
+                        if PostQueuedCompletionStatus(
                             self.iocp as *mut c_void,
                             0,
                             0,
                             &mut (*op_ptr).ov,
-                        );
+                        ) == 0
+                        {
+                            let error = GetLastError();
+                            self.pending.borrow_mut().remove(&addr);
+                            return Err(win_error("PostQueuedCompletionStatus", error));
+                        }
                     }
                 }
             }
-            addr
+            Ok(addr)
         }
 
-        fn launch_write(&self, handle: isize, mut op: Box<Op>, dptr: *const u8, len: u32) -> usize {
+        fn launch_write(
+            &self,
+            handle: isize,
+            mut op: Box<Op>,
+            dptr: *const u8,
+            len: u32,
+        ) -> PyResult<usize> {
+            op.handle = handle;
             let op_ptr = op.as_mut() as *mut Op;
             let addr = op_ptr as usize;
             self.pending.borrow_mut().insert(addr, op);
@@ -1386,16 +1592,21 @@ mod iocp {
                     let e = GetLastError();
                     if e != ERROR_IO_PENDING {
                         (*op_ptr).status = e as i32;
-                        PostQueuedCompletionStatus(
+                        if PostQueuedCompletionStatus(
                             self.iocp as *mut c_void,
                             0,
                             0,
                             &mut (*op_ptr).ov,
-                        );
+                        ) == 0
+                        {
+                            let error = GetLastError();
+                            self.pending.borrow_mut().remove(&addr);
+                            return Err(win_error("PostQueuedCompletionStatus", error));
+                        }
                     }
                 }
             }
-            addr
+            Ok(addr)
         }
     }
 
@@ -1469,19 +1680,20 @@ mod iocp {
             Ok(handle as isize)
         }
 
-        fn close(&self, handle: isize) {
-            unsafe {
-                CloseHandle(handle as *mut c_void);
+        fn close(&self, handle: isize) -> PyResult<()> {
+            if unsafe { CloseHandle(handle as *mut c_void) } == 0 {
+                let error = unsafe { GetLastError() };
+                return Err(pyo3::exceptions::PyOSError::new_err((
+                    0i32,
+                    format!("CloseHandle failed (winerror {error})"),
+                    Option::<String>::None,
+                    error as i32,
+                )));
             }
+            Ok(())
         }
 
-        fn submit_read(
-            &self,
-            py: Python<'_>,
-            handle: isize,
-            offset: u64,
-            len: u32,
-        ) -> PyResult<usize> {
+        fn prepare_read(&self, py: Python<'_>, offset: u64, len: u32) -> PyResult<usize> {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
             let (rbuf, rptr) = alloc_pybytes(py, len as usize)?;
             let mut op = Box::new(Op {
@@ -1497,15 +1709,21 @@ mod iocp {
             });
             op.ov.Anonymous.Anonymous.Offset = (offset & 0xFFFF_FFFF) as u32;
             op.ov.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
-            Ok(self.launch_read(handle, op, len))
+            let addr = op.as_mut() as *mut Op as usize;
+            self.pending.borrow_mut().insert(addr, op);
+            Ok(addr)
         }
 
-        fn submit_write(&self, handle: isize, offset: u64, data: Bound<'_, PyBytes>) -> usize {
+        fn start_read(&self, addr: usize, handle: isize, len: u32) -> PyResult<()> {
+            let op = self.pending.borrow_mut().remove(&addr).ok_or_else(|| {
+                pyo3::exceptions::PyOSError::new_err("IOCP operation is no longer pending")
+            })?;
+            self.launch_read(handle, op, len)?;
+            Ok(())
+        }
+
+        fn prepare_write(&self, offset: u64, data: Bound<'_, PyBytes>) -> PyResult<usize> {
             let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-            let (dptr, len) = {
-                let b = data.as_bytes();
-                (b.as_ptr(), b.len() as u32)
-            };
             let mut op = Box::new(Op {
                 ov: unsafe { std::mem::zeroed() },
                 id,
@@ -1519,7 +1737,22 @@ mod iocp {
             });
             op.ov.Anonymous.Anonymous.Offset = (offset & 0xFFFF_FFFF) as u32;
             op.ov.Anonymous.Anonymous.OffsetHigh = (offset >> 32) as u32;
-            self.launch_write(handle, op, dptr, len)
+            let addr = op.as_mut() as *mut Op as usize;
+            self.pending.borrow_mut().insert(addr, op);
+            Ok(addr)
+        }
+
+        fn start_write(&self, py: Python<'_>, addr: usize, handle: isize) -> PyResult<()> {
+            let op = self.pending.borrow_mut().remove(&addr).ok_or_else(|| {
+                pyo3::exceptions::PyOSError::new_err("IOCP operation is no longer pending")
+            })?;
+            let data = op.wbuf.as_ref().unwrap();
+            let (dptr, len) = {
+                let bytes = data.bind(py);
+                (bytes.as_bytes().as_ptr(), bytes.as_bytes().len() as u32)
+            };
+            self.launch_write(handle, op, dptr, len)?;
+            Ok(())
         }
 
         /// Reap a completed op: return its bytes (read) or transferred count
@@ -1527,7 +1760,11 @@ mod iocp {
         fn take(&self, py: Python<'_>, addr: usize, transferred: u32) -> PyResult<Py<PyAny>> {
             let mut op = match self.pending.borrow_mut().remove(&addr) {
                 Some(o) => o,
-                None => return Ok(py.None()),
+                None => {
+                    return Err(pyo3::exceptions::PyOSError::new_err(
+                        "unknown IOCP completion",
+                    ))
+                }
             };
             let status = if op.status != 0 {
                 op.status
@@ -1548,7 +1785,7 @@ mod iocp {
                 )));
             }
             match op.kind {
-                OP_READ => Ok(take_read_payload(py, &mut op, transferred as usize)),
+                OP_READ => take_read_payload(py, &mut op, transferred as usize),
                 _ => Ok(transferred.into_pyobject(py).unwrap().into_any().unbind()),
             }
         }
@@ -1559,6 +1796,20 @@ mod iocp {
         /// popped the completion, so the kernel is finished with the buffer.
         fn discard(&self, addr: usize) {
             self.pending.borrow_mut().remove(&addr);
+        }
+
+        fn cancel(&self, addr: usize) -> PyResult<()> {
+            let mut pending = self.pending.borrow_mut();
+            let Some(op) = pending.get_mut(&addr) else {
+                return Ok(());
+            };
+            if unsafe { CancelIoEx(op.handle as *mut c_void, &op.ov) } == 0 {
+                let error = unsafe { GetLastError() };
+                if error != 1168 {
+                    return Err(win_error("CancelIoEx", error));
+                }
+            }
+            Ok(())
         }
     }
 }

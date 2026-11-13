@@ -33,6 +33,26 @@ async def test_invalid_text_encoding_closes_opened_file(backend, tmpfile, monkey
     assert closed == opened
 
 
+async def test_append_filesize_error_closes_file(backend, tmpfile, monkeypatch):
+    tmpfile.write_bytes(b'x')
+    active = urio.get_backend()
+    original_close = active.close
+    closed = []
+
+    async def failing_filesize(fd):
+        raise OSError(5, 'size unavailable')
+
+    async def tracked_close(fd):
+        closed.append(fd)
+        await original_close(fd)
+
+    monkeypatch.setattr(active, 'filesize', failing_filesize)
+    monkeypatch.setattr(active, 'close', tracked_close)
+    with pytest.raises(OSError, match='size unavailable'):
+        await urio.open(tmpfile, 'ab')
+    assert len(closed) == 1
+
+
 async def test_text_crlf_across_chunk_boundary(backend, tmpfile):
     from urio.file import DEFAULT_CHUNK
 

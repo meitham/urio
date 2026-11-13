@@ -33,6 +33,7 @@ async def test_cancelled_fixed_close_recycles_only_after_success():
     driver._loop = asyncio.get_running_loop()
     driver._ring = FakeRing()
     driver._closed = False
+    driver._failed = None
     driver._depth = 8
     driver._inflight = 0
     driver._waiters = collections.deque()

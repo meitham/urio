@@ -118,6 +118,7 @@ class AsyncBufferedFile:
         self._writable = writable
         self._backend = get_backend()
         self._closed = False
+        self._close_task: asyncio.Task | None = None
         self._appending = appending
         self._offset: int = size if appending else 0
         self._buf: bytes = b''
@@ -385,10 +386,31 @@ class AsyncBufferedFile:
         await self._backend.fsync(self._fd, datasync=True)
 
     async def close(self) -> None:
-        if self._closed:
+        if self._closed and self._close_task is not None and self._close_task.done():
             return
-        self._closed = True
-        await self._backend.close(self._fd)
+        if self._close_task is None:
+            if self._closed:
+                return
+            self._closed = True
+            self._close_task = asyncio.create_task(self._backend.close(self._fd))
+        task = self._close_task
+        try:
+            await asyncio.wait({task})
+            await task
+        except asyncio.CancelledError:
+            loop = asyncio.get_running_loop()
+
+            def report_close_error(done: asyncio.Task) -> None:
+                if not done.cancelled() and (error := done.exception()) is not None:
+                    loop.call_exception_handler(
+                        {
+                            'message': 'File close failed after cancellation',
+                            'exception': error,
+                        }
+                    )
+
+            task.add_done_callback(report_close_error)
+            raise
 
     async def __aenter__(self):
         return self
@@ -697,10 +719,7 @@ async def _open(
     try:
         size = 0
         if appending:
-            try:
-                size = await backend.filesize(fd)
-            except OSError:
-                size = 0
+            size = await backend.filesize(fd)
 
         raw = AsyncBufferedFile(
             fd,

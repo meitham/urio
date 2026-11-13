@@ -20,6 +20,7 @@ It also ships :class:`urio.Path`, an async ``pathlib.Path`` with truly-async
 from __future__ import annotations
 
 import asyncio as _asyncio
+import builtins as _builtins
 import sys as _sys
 
 from ._version import __version__
@@ -49,7 +50,7 @@ async def aclose() -> None:
     """Release the running loop's native I/O resources deterministically.
 
     Shuts down whichever driver (io_uring ring + eventfd, or IOCP poller) this
-    loop lazily created, cancelling any still-pending operations. On Linux this
+    loop lazily created, failing any still-pending operations. On Linux this
     is optional — drivers are also reclaimed when the loop is garbage
     collected, from any thread — but useful for embedders that create many
     loops or want a clean teardown point. With the Windows IOCP backend it is
@@ -60,11 +61,19 @@ async def aclose() -> None:
     """
     loop = _asyncio.get_running_loop()
     closed_poller = False
+    errors = []
     for name in ('urio.driver', 'urio.driver_iocp', 'urio.driver_iocp_proactor'):
         mod = _sys.modules.get(name)
         if mod is not None:
             if name == 'urio.driver_iocp':
                 closed_poller = True
-            mod.close_driver(loop)
+            try:
+                mod.close_driver(loop)
+            except Exception as error:
+                errors.append(error)
     if closed_poller:
         await _asyncio.sleep(0)
+    if len(errors) == 1:
+        raise errors[0]
+    if errors:
+        raise _builtins.ExceptionGroup('urio driver shutdown failed', errors)

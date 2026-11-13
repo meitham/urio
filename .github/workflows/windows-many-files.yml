@@ -1,0 +1,85 @@
+name: Windows many files
+
+on:
+  push:
+    branches: [main, 'review/**']
+    paths:
+      - '.github/workflows/windows-many-files.yml'
+      - 'python/urio/**'
+      - 'src/**'
+      - 'tests/test_windows_many_files.py'
+      - 'tests/test_backend.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'pyproject.toml'
+  pull_request:
+    paths:
+      - '.github/workflows/windows-many-files.yml'
+      - 'python/urio/**'
+      - 'src/**'
+      - 'tests/test_windows_many_files.py'
+      - 'tests/test_backend.py'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'pyproject.toml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stress:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - python: '3.12'
+            build_args: ''
+          - python: '3.13'
+            build_args: ''
+          - python: '3.14'
+            build_args: ''
+          - python: '3.15'
+            build_args: ''
+          - python: '3.14t'
+            build_args: '-i python'
+          - python: '3.15t'
+            build_args: '-i python'
+    runs-on: windows-latest
+    timeout-minutes: 20
+    env:
+      URIO_WINDOWS_IOCP: '1'
+      URIO_STRESS_TEST: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'maturin>=1.15,<2' pytest pytest-asyncio
+          maturin build --release --out dist ${{ matrix.build_args }}
+          python scripts/check_wheels.py dist
+          pip install --no-index --find-links dist urio
+      - name: Stress test
+        shell: pwsh
+        run: |
+          $tests = @(
+            'tests/test_windows_many_files.py'
+            'tests/test_backend.py::test_close_invalid_handle_raises'
+            'tests/test_backend.py::test_iocp_readall_sizes_small_reads'
+            'tests/test_backend.py::test_thread_readall_serializes_shared_fd'
+            'tests/test_backend.py::test_proactor_completion_error_does_not_discard_reused_address'
+          )
+          $output = & pytest -q --tb=short @tests 2>&1
+          $code = $LASTEXITCODE
+          $output | Out-Host
+          if ($code -ne 0) {
+            $summary = $output | Out-String
+            $summary = $summary.Substring([Math]::Max(0, $summary.Length - 4000))
+            $summary = $summary.Replace('%', '%25').Replace("`r", '%0D').Replace("`n", '%0A')
+            Write-Output "::error title=Windows stress failure::$summary"
+            exit $code
+          }

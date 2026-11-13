@@ -1,0 +1,33 @@
+name: Windows 500k handle probe
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 30
+    env:
+      URIO_WINDOWS_IOCP: '1'
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-python@v7
+        with:
+          python-version: '3.15'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install
+        run: |
+          python -m pip install --upgrade pip
+          pip install 'maturin>=1.15,<2' psutil
+          maturin build --release --out dist
+          python scripts/check_wheels.py dist
+          pip install --no-index --find-links dist urio
+      - name: Probe default backend
+        run: python scripts/probe_windows_500k.py --backend thread --target 10000
+      - name: Probe IOCP backend
+        run: python scripts/probe_windows_500k.py --backend iocp --target 500000
+      - name: Probe 500k distinct files
+        run: python scripts/probe_windows_500k.py --backend iocp --target 500000 --distinct --max-seconds 600

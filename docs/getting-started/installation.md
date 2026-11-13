@@ -8,7 +8,7 @@ python -m pip install urio
 
 urio requires CPython 3.12 or newer. Regular CPython 3.12–3.15 uses wheels
 built against Python's stable ABI. Free-threaded Python requires a separate
-wheel for each interpreter version. The 0.3.0 release provides 3.14t and
+wheel for each interpreter version. The 0.3.1 release provides 3.14t and
 3.15t wheels.
 
 On Linux, urio uses io_uring if the kernel supports the required operations

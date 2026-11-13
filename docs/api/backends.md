@@ -34,9 +34,23 @@ has been enabled, then the thread backend.
 ## `await urio.aclose()`
 
 Release native I/O resources associated with the running event loop and
-cancel pending operations. The next operation on that loop creates a new
+fail pending operations with `OSError`. The next operation on that loop creates a new
 driver. Call this before closing an event loop running in a worker thread
-with the Windows IOCP backend.
+with the Windows IOCP backend. Close files before calling `aclose()`. An
+IOCP file handle remains associated with the event loop that opened it;
+reads and writes on that handle after `aclose()` raise `OSError`. A handle
+opened on another event loop also raises `OSError`.
+
+An awaited file operation raises the operating system error when it fails.
+Cancellation of the awaiting task raises `asyncio.CancelledError`. If a
+cancelled operation later fails while its resources are being cleaned up,
+the error is sent to the loop's exception handler because the original
+awaiter has gone. A failed `aclose()` raises after trying to shut down each
+driver.
+
+If the io_uring driver itself fails, pending operations raise `OSError` and
+later operations on that driver do the same. Call `aclose()` to release it;
+the next operation creates a new driver.
 
 ## Environment variables
 

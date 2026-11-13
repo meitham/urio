@@ -25,7 +25,7 @@ from . import _uring
 _DRIVER_ATTR = '_urio_uring_driver'
 _drivers: weakref.WeakKeyDictionary = weakref.WeakKeyDictionary()
 
-_RETRYABLE = (_errno.EAGAIN, _errno.EBUSY)
+_RETRYABLE = (_errno.EAGAIN, _errno.EBUSY, _errno.EINTR)
 _MAX_FLUSH_RETRIES = 16
 
 _DEFAULT_ENTRIES = 512
@@ -45,12 +45,19 @@ def _ring_entries() -> int:
 def _close_abandoned_open(fut: asyncio.Future) -> None:
     try:
         fd, _ = fut.result()
+    except OSError as error:
+        fut.get_loop().call_exception_handler(
+            {'message': 'Cancelled file open failed', 'exception': error}
+        )
+        return
     except BaseException:
         return
     try:
         os.close(fd)
-    except OSError:
-        pass
+    except OSError as error:
+        fut.get_loop().call_exception_handler(
+            {'message': 'Could not close an abandoned file', 'exception': error}
+        )
 
 
 class _Chain:
@@ -82,6 +89,7 @@ class Driver:
         self._eventfd = self._ring.eventfd
         self._futures: dict[int, asyncio.Future] = {}
         self._closed = False
+        self._failed: OSError | None = None
         self._depth = entries
         self._inflight = 0
         self._waiters: collections.deque[asyncio.Future] = collections.deque()
@@ -109,7 +117,7 @@ class Driver:
         try:
             await fut
         except BaseException:
-            if fut.cancelled():
+            if not fut.done() or fut.cancelled() or fut.exception() is not None:
                 try:
                     self._waiters.remove(fut)
                 except ValueError:
@@ -133,26 +141,29 @@ class Driver:
 
     def _flush(self) -> None:
         self._flush_scheduled = False
-        if self._closed:
+        if self._closed or self._failed is not None:
             return
         try:
             self._ring.submit()
-        except OSError as e:
-            if e.errno in _RETRYABLE and self._flush_retries < _MAX_FLUSH_RETRIES:
+        except Exception as e:
+            if (
+                isinstance(e, OSError)
+                and e.errno in _RETRYABLE
+                and self._flush_retries < _MAX_FLUSH_RETRIES
+            ):
                 self._flush_retries += 1
                 self._schedule_flush()
                 return
             failed, self._unflushed = self._unflushed, []
             self._flush_retries = 0
+            failure = OSError(
+                getattr(e, 'errno', None) or _errno.EIO, f'io_uring submit failed: {e}'
+            )
             for ident in failed:
-                fut = self._futures.pop(ident, None)
-                self._open_ids.discard(ident)
-                self._recycle_on_done.pop(ident, None)
-                self._release_slot()
+                fut = self._futures.get(ident)
                 if fut is not None and not fut.done():
-                    fut.set_exception(
-                        OSError(e.errno or 0, f'io_uring submit failed: {e}')
-                    )
+                    fut.set_exception(failure)
+            self._fail(failure, remove_reader=False)
             return
         self._unflushed.clear()
         self._flush_retries = 0
@@ -160,8 +171,29 @@ class Driver:
 
     def _on_ready(self) -> None:
         """Reader callback: drain the eventfd and resolve completed futures."""
-        self._ring.drain_eventfd()
-        self._reap()
+        try:
+            self._ring.drain_eventfd()
+            self._reap()
+        except Exception as error:
+            self._fail(OSError(_errno.EIO, f'io_uring completion failed: {error}'))
+
+    def _fail(self, error: OSError, *, remove_reader: bool = True) -> None:
+        self._failed = error
+        if remove_reader:
+            try:
+                self._loop.remove_reader(self._eventfd)
+            except Exception:
+                pass
+        for fut in self._futures.values():
+            if not fut.done():
+                fut.set_exception(error)
+        while self._waiters:
+            waiter = self._waiters.popleft()
+            if not waiter.done():
+                waiter.set_exception(error)
+        self._loop.call_exception_handler(
+            {'message': 'io_uring driver failed', 'exception': error}
+        )
 
     def _reap(self) -> None:
         for ident, result, payload in self._ring.reap():
@@ -170,6 +202,13 @@ class Driver:
                 slot = self._recycle_on_done.pop(ident, None)
                 if slot is not None and result >= 0:
                     self._slots.append(slot)
+                elif slot is not None:
+                    self._loop.call_exception_handler(
+                        {
+                            'message': 'Could not close fixed file',
+                            'exception': OSError(-result, os.strerror(-result)),
+                        }
+                    )
                 continue
             slot = self._recycle_on_done.pop(ident, None)
             if slot is not None and result >= 0:
@@ -189,8 +228,13 @@ class Driver:
                 if was_open and result >= 0:
                     try:
                         os.close(result)
-                    except OSError:
-                        pass
+                    except OSError as error:
+                        self._loop.call_exception_handler(
+                            {
+                                'message': 'Could not close an abandoned file',
+                                'exception': error,
+                            }
+                        )
                 continue
             try:
                 if result < 0:
@@ -199,7 +243,7 @@ class Driver:
                     fut.set_result((result, payload))
             except Exception:
                 if not fut.done():
-                    fut.cancel()
+                    fut.set_exception(OSError(_errno.EIO, 'io_uring completion failed'))
 
     def _await_id(self, ident: int) -> asyncio.Future:
         fut = self._loop.create_future()
@@ -212,7 +256,10 @@ class Driver:
             return
         try:
             cid = self._ring.submit_cancel(ident)
-        except (OSError, AttributeError):
+        except (OSError, AttributeError) as error:
+            self._loop.call_exception_handler(
+                {'message': 'Could not cancel io_uring operation', 'exception': error}
+            )
             return
         self._untracked.add(cid)
         self._schedule_flush()
@@ -223,7 +270,12 @@ class Driver:
         """Submit via ``submit`` (returns an id) and await its completion."""
         if self._closed:
             raise RuntimeError('driver is closed')
+        if self._failed is not None:
+            raise self._failed
         await self._acquire_slot()
+        if self._failed is not None:
+            self._release_slot()
+            raise self._failed
         try:
             ident = submit(self._ring)
         except BaseException:
@@ -246,10 +298,15 @@ class Driver:
     async def read(self, fd: int, offset: int, length: int) -> bytes:
         if self._closed:
             raise RuntimeError('driver is closed')
+        if self._failed is not None:
+            raise self._failed
         if self._inflight < self._depth:
             self._inflight += 1
         else:
             await self._park_for_slot()
+        if self._failed is not None:
+            self._release_slot()
+            raise self._failed
         try:
             ident = self._ring.submit_read(fd, offset, length)
         except BaseException:
@@ -269,10 +326,15 @@ class Driver:
         off = (1 << 64) - 1 if append else offset
         if self._closed:
             raise RuntimeError('driver is closed')
+        if self._failed is not None:
+            raise self._failed
         if self._inflight < self._depth:
             self._inflight += 1
         else:
             await self._park_for_slot()
+        if self._failed is not None:
+            self._release_slot()
+            raise self._failed
         try:
             ident = self._ring.submit_write(fd, off, data)
         except BaseException:
@@ -362,6 +424,8 @@ class Driver:
         payload/result) or None when no fixed slot is available."""
         if self._closed:
             raise RuntimeError('driver is closed')
+        if self._failed is not None:
+            raise self._failed
         if not self._slots:
             return None
         slot = self._slots.popleft()
@@ -387,19 +451,13 @@ class Driver:
         self._chains[io_id] = chain
         try:
             await ofut
-        except asyncio.CancelledError:
+        except BaseException:
             self._abandon_chain(chain, ofut, iofut)
-            raise
-        except OSError:
-            self._abandon_chain(chain, iofut)
             raise
         try:
             result, payload = await iofut
-        except asyncio.CancelledError:
+        except BaseException:
             self._abandon_chain(chain, iofut)
-            raise
-        except OSError:
-            self._abandon_chain(chain)
             raise
         return slot, (payload if payload is not None else result)
 
@@ -457,7 +515,10 @@ class Driver:
             return
         try:
             cid = self._ring.submit_close_fixed(slot)
-        except OSError:
+        except OSError as error:
+            self._loop.call_exception_handler(
+                {'message': 'Could not close fixed file', 'exception': error}
+            )
             return
         self._untracked.add(cid)
         self._recycle_on_done[cid] = slot
@@ -477,7 +538,7 @@ class Driver:
             pass
         for fut in self._futures.values():
             if not fut.done():
-                fut.cancel()
+                fut.set_exception(OSError(_errno.EBADF, 'io_uring driver is closed'))
         self._futures.clear()
         self._unflushed.clear()
         self._untracked.clear()
@@ -487,7 +548,7 @@ class Driver:
         while self._waiters:
             w = self._waiters.popleft()
             if not w.done():
-                w.cancel()
+                w.set_exception(OSError(_errno.EBADF, 'io_uring driver is closed'))
 
 
 def get_driver(loop: asyncio.AbstractEventLoop | None = None) -> Driver:

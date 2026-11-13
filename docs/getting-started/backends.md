@@ -24,6 +24,17 @@ The thread backend uses the event loop's default executor. It is selected on
 macOS, when io_uring cannot be used, and by default on Windows. It is also
 available explicitly on any platform.
 
+On Windows, the thread backend uses
+[C runtime file descriptors](https://learn.microsoft.com/en-us/cpp/c-runtime-library/reference/setmaxstdio).
+The runtime allows at most 8,192 open descriptors per process, including
+those used by other code. When the limit is reached, `urio.open()` raises
+`OSError` with `errno.EMFILE`. The IOCP backend uses Windows handles, so
+the C runtime limit does not apply. In a
+[Windows runner test](https://github.com/meitham/urio/actions/runs/43398037316),
+IOCP opened 500,000 distinct files at once, read samples, and closed every
+file. Available memory and the filesystem still determine what a given
+machine can handle.
+
 ## Selecting a backend
 
 ```python

@@ -295,10 +295,7 @@ class AsyncPath:
         fd = await backend.open(str(self._path), flags, mode)
         await backend.close(fd)
         if exist_ok:
-            try:
-                await backend.utime(str(self._path), None)
-            except OSError:
-                pass
+            await backend.utime(str(self._path), None)
 
     async def chmod(self, mode):
         await get_backend().chmod(str(self._path), mode)

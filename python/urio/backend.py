@@ -91,6 +91,28 @@ async def _to_thread_open(path: str, flags: int, mode: int) -> int:
 
 
 _orphans: dict[int, set[asyncio.Future]] = {}
+_fd_locks: dict[int, threading.Lock] = {}
+_fd_locks_guard = threading.Lock()
+
+
+def _fd_lock(fd: int) -> threading.Lock:
+    with _fd_locks_guard:
+        lock = _fd_locks.get(fd)
+        if lock is None:
+            lock = threading.Lock()
+            _fd_locks[fd] = lock
+        return lock
+
+
+def _close_fd(fd: int) -> None:
+    lock = _fd_lock(fd)
+    try:
+        with lock:
+            os.close(fd)
+    finally:
+        with _fd_locks_guard:
+            if _fd_locks.get(fd) is lock:
+                _fd_locks.pop(fd)
 
 
 def _reap_orphan(fd: int, fut: asyncio.Future) -> None:
@@ -100,7 +122,10 @@ def _reap_orphan(fd: int, fut: asyncio.Future) -> None:
         if not s:
             _orphans.pop(fd, None)
     if not fut.cancelled():
-        fut.exception()
+        if error := fut.exception():
+            fut.get_loop().call_exception_handler(
+                {'message': 'Cancelled file operation failed', 'exception': error}
+            )
 
 
 async def _to_thread_fd(fd, fn, *args):
@@ -145,8 +170,9 @@ if hasattr(os, 'pread'):
 else:
 
     def _pread(fd: int, n: int, offset: int) -> bytes:
-        os.lseek(fd, offset, os.SEEK_SET)
-        return os.read(fd, n)
+        with _fd_lock(fd):
+            os.lseek(fd, offset, os.SEEK_SET)
+            return os.read(fd, n)
 
     def _fileio_write(fd: int, data: bytes) -> int:
         f = io.FileIO(fd, 'w', closefd=False)
@@ -156,11 +182,13 @@ else:
             f.close()
 
     def _pwrite(fd: int, data: bytes, offset: int) -> int:
-        os.lseek(fd, offset, os.SEEK_SET)
-        return _fileio_write(fd, data)
+        with _fd_lock(fd):
+            os.lseek(fd, offset, os.SEEK_SET)
+            return _fileio_write(fd, data)
 
     def _append_write(fd: int, data: bytes) -> int:
-        return _fileio_write(fd, data)
+        with _fd_lock(fd):
+            return _fileio_write(fd, data)
 
 
 _fdatasync = getattr(os, 'fdatasync', os.fsync)
@@ -174,12 +202,13 @@ def _read_all(fd: int, offset: int) -> bytes:
     (on Windows ~4x, enough to beat aiofiles' buffered ``read()``), correctly
     handles short reads, and avoids the extra EOF read the loop paid per call.
     ``closefd=False`` leaves the fd open for the backend to close as usual."""
-    os.lseek(fd, offset, os.SEEK_SET)
-    reader = io.FileIO(fd, mode='r', closefd=False)
-    try:
-        return reader.readall()
-    finally:
-        reader.close()
+    with _fd_lock(fd):
+        os.lseek(fd, offset, os.SEEK_SET)
+        reader = io.FileIO(fd, mode='r', closefd=False)
+        try:
+            return reader.readall()
+        finally:
+            reader.close()
 
 
 async def _drain_to_eof(read, pos: int, parts: list) -> None:
@@ -282,7 +311,7 @@ class ThreadBackend:
 
     async def close(self, fd: int) -> None:
         await _drain_orphans(fd)
-        await _to_thread(os.close, fd)
+        await _to_thread(_close_fd, fd)
 
     async def statx(self, path: str, follow: bool = True) -> os.stat_result:
         return await _to_thread(os.stat if follow else os.lstat, path)
@@ -499,6 +528,7 @@ class IocpBackend(ThreadBackend):
     See :mod:`urio.driver_iocp`."""
 
     name = 'iocp'
+    _owners: dict[int, tuple[asyncio.AbstractEventLoop, object]] = {}
 
     def _driver(self):
         loop = asyncio.get_running_loop()
@@ -512,32 +542,51 @@ class IocpBackend(ThreadBackend):
 
         return get_iocp_driver(loop)
 
+    def _driver_for(self, handle: int):
+        owner = self._owners.get(handle)
+        if owner is None:
+            return self._driver()
+        loop, driver = owner
+        if loop is not asyncio.get_running_loop():
+            raise OSError(errno.EBADF, 'IOCP file belongs to another event loop')
+        return driver
+
     async def open(self, path: str, flags: int, mode: int) -> int:
         write = bool(flags & (os.O_WRONLY | os.O_RDWR))
         create = bool(flags & os.O_CREAT)
         truncate = bool(flags & os.O_TRUNC)
         exclusive = bool(flags & os.O_EXCL)
-        return await self._driver().open(path, write, create, truncate, exclusive)
+        driver = self._driver()
+        handle = await driver.open(path, write, create, truncate, exclusive)
+        self._owners[handle] = (asyncio.get_running_loop(), driver)
+        return handle
 
     async def read(self, fd: int, offset: int, length: int) -> bytes:
-        return await self._driver().read(fd, offset, length)
+        return await self._driver_for(fd).read(fd, offset, length)
 
     async def readall(self, fd: int, offset: int) -> bytes:
-        driver = self._driver()
+        driver = self._driver_for(fd)
         parts = []
-        while True:
-            chunk = await driver.read(fd, offset, _READ_CHUNK)
+        try:
+            size = await self.filesize(fd)
+        except OSError:
+            size = offset
+        while offset < size:
+            chunk = await driver.read(fd, offset, min(size - offset, _READ_CHUNK))
             if not chunk:
                 break
             parts.append(chunk)
             offset += len(chunk)
-        return b''.join(parts)
+        await _drain_to_eof(
+            lambda pos, length: driver.read(fd, pos, length), offset, parts
+        )
+        return parts[0] if len(parts) == 1 else b''.join(parts)
 
     async def write(
         self, fd: int, offset: int, data: bytes, append: bool = False
     ) -> int:
         off = (1 << 64) - 1 if append else offset
-        return await self._driver().write(fd, off, data)
+        return await self._driver_for(fd).write(fd, off, data)
 
     async def fsync(self, fd: int, datasync: bool = False) -> None:
         import ctypes
@@ -576,7 +625,10 @@ class IocpBackend(ThreadBackend):
 
     async def close(self, fd: int) -> None:
         await _drain_orphans(fd)
-        await self._driver().close(fd)
+        try:
+            await self._driver_for(fd).close(fd)
+        finally:
+            self._owners.pop(fd, None)
 
 
 def _iocp_ok() -> bool:

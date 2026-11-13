@@ -17,6 +17,7 @@ matching future on the loop thread.
 from __future__ import annotations
 
 import asyncio
+import errno
 import weakref
 
 from . import _uring
@@ -30,17 +31,22 @@ class _Ov:
     ``address`` (of the native OVERLAPPED), a ``pending`` flag, and ``cancel()``.
     Backed by a Rust-owned op kept alive until its completion is reaped."""
 
-    __slots__ = ('address', 'pending', '_io')
+    __slots__ = ('address', 'pending', '_io', '_consumed', '_started')
 
     def __init__(self, address: int, io) -> None:
         self.address = address
         self.pending = True
         self._io = io
+        self._consumed = False
+        self._started = False
 
     def cancel(self) -> None:
-        pass
+        if self._started and not self._consumed:
+            self._io.cancel(self.address)
 
     def __del__(self) -> None:
+        if self._consumed:
+            return
         try:
             self._io.discard(self.address)
         except Exception:
@@ -56,11 +62,34 @@ class ProactorDriver:
         self._io = _uring.ProactorIo(self._proactor._iocp)
 
     def _complete(self, transferred, key, ov):
-        return self._io.take(ov.address, transferred or 0)
+        try:
+            try:
+                return self._io.take(ov.address, transferred or 0)
+            except OSError:
+                raise
+            except Exception as error:
+                raise OSError(errno.EIO, 'IOCP completion failed') from error
+        finally:
+            ov._consumed = True
 
-    def _await_op(self, address: int, handle: int):
+    async def _await_op(self, address: int, handle: int, start):
         ov = _Ov(address, self._io)
-        return self._proactor._register(ov, handle, self._complete)
+        try:
+            future = self._proactor._register(ov, handle, self._complete)
+        except BaseException:
+            self._io.discard(address)
+            ov._consumed = True
+            raise
+        try:
+            start(address, handle)
+        except BaseException:
+            self._proactor._cache.pop(address, None)
+            future.cancel()
+            self._io.discard(address)
+            ov._consumed = True
+            raise
+        ov._started = True
+        return await future
 
     async def open(
         self, path: str, write: bool, create: bool, truncate: bool, exclusive: bool
@@ -68,13 +97,15 @@ class ProactorDriver:
         return self._io.open(path, write, create, truncate, exclusive)
 
     async def read(self, handle: int, offset: int, length: int) -> bytes:
-        address = self._io.submit_read(handle, offset, length)
-        data = await self._await_op(address, handle)
+        address = self._io.prepare_read(offset, length)
+        data = await self._await_op(
+            address, handle, lambda addr, h: self._io.start_read(addr, h, length)
+        )
         return data if data is not None else b''
 
     async def write(self, handle: int, offset: int, data: bytes) -> int:
-        address = self._io.submit_write(handle, offset, data)
-        return await self._await_op(address, handle)
+        address = self._io.prepare_write(offset, data)
+        return await self._await_op(address, handle, self._io.start_write)
 
     async def close(self, handle: int) -> None:
         self._io.close(handle)
